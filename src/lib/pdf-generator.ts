@@ -11,9 +11,15 @@
  *      which is required for html2canvas.  Using `position:fixed` with a large
  *      negative z-index (the previous approach) prevented html2canvas from
  *      painting the element.
- *   5. Capture with html2canvas → convert to jsPDF A4 PDF → save
+ *   5. Capture with html2canvas-pro → convert to jsPDF A4 PDF → save
  *
- * Dynamic imports keep jsPDF / html2canvas out of the SSR bundle entirely.
+ * html2canvas-pro is used instead of html2canvas because Tailwind v4 emits
+ * computed CSS colors using modern CSS color functions (lab(), oklch(), oklab())
+ * which the original html2canvas does not support, causing a console error and
+ * blank/incorrect capture output.  html2canvas-pro adds full support for these
+ * color spaces and is otherwise a drop-in replacement.
+ *
+ * Dynamic imports keep jsPDF / html2canvas-pro out of the SSR bundle entirely.
  */
 
 export interface DietitianPDFData {
@@ -129,9 +135,11 @@ export async function downloadDocumentAsPDF(input: DownloadPDFInput): Promise<vo
   const timestamp = formatTimestamp()
 
   // Dynamic import — deferred until first call, never included in the SSR bundle
+  // html2canvas-pro handles modern CSS color functions (lab, oklch, oklab) that
+  // Tailwind v4 emits in computed styles; plain html2canvas cannot parse them.
   const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
     import('jspdf'),
-    import('html2canvas'),
+    import('html2canvas-pro'),
   ])
 
   // ── Build off-screen wrapper ────────────────────────────────────────────
