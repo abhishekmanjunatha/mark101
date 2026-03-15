@@ -64,6 +64,15 @@ interface DocumentComposerProps {
   initialPatient?: PatientContext | null
 }
 
+// ── Document type labels ───────────────────────────────────────────────────
+
+const DOC_TYPE_LABELS: Record<string, string> = {
+  quick_note: 'Quick Note',
+  meal_plan: 'Meal Plan',
+  follow_up_recommendation: 'Follow-up Recommendation',
+  custom: 'Custom Document',
+}
+
 // ── Default blocks per document type ───────────────────────────────────────
 
 function defaultBlocksForType(type: DocumentType): DocumentBlock[] {
@@ -280,25 +289,50 @@ export function DocumentComposer({
       if (action === 'suggest') {
         setAiSuggestions(data.result ?? null)
       } else {
-        // Replace all non-title blocks content with AI result
-        // Parse sections from AI output
         const aiResult = data.result ?? ''
-        const sections = aiResult.split(/^## /m).filter(Boolean)
-        if (sections.length > 0) {
-          setBlocks((prev) => {
-            const updated = [...prev]
-            let sectionIdx = 0
-            for (let i = 0; i < updated.length; i++) {
-              if (updated[i].type === 'title') continue
-              if (sectionIdx < sections.length) {
-                const sectionContent = sections[sectionIdx].replace(/^[^\n]+\n/, '').trim()
-                updated[i] = { ...updated[i], content: sectionContent }
-                sectionIdx++
-              }
-            }
-            return updated
-          })
+        // Split on ## headings (the format we instruct the AI to use)
+        const rawSections = aiResult.split(/^##\s+/m).filter(Boolean)
+
+        // Build label→content map for label-based matching
+        const sectionMap: Record<string, string> = {}
+        for (const raw of rawSections) {
+          const newlineIdx = raw.indexOf('\n')
+          if (newlineIdx === -1) {
+            sectionMap[raw.trim().toLowerCase()] = ''
+          } else {
+            const heading = raw.slice(0, newlineIdx).trim().toLowerCase()
+            const content = raw.slice(newlineIdx + 1).trim()
+            sectionMap[heading] = content
+          }
         }
+
+        const hasLabelMatches = Object.keys(sectionMap).length > 0
+
+        setBlocks((prev) => {
+          if (hasLabelMatches) {
+            // Primary strategy: match blocks to AI sections by label name
+            return prev.map((b) => {
+              if (b.type === 'title') return b
+              const key = b.label.toLowerCase()
+              return key in sectionMap ? { ...b, content: sectionMap[key] } : b
+            })
+          }
+          // Fallback: AI ignored ## format — do positional mapping
+          const updated = [...prev]
+          let sectionIdx = 0
+          for (let i = 0; i < updated.length; i++) {
+            if (updated[i].type === 'title') continue
+            if (sectionIdx < rawSections.length) {
+              const raw = rawSections[sectionIdx]
+              const newlineIdx = raw.indexOf('\n')
+              const content = newlineIdx !== -1 ? raw.slice(newlineIdx + 1).trim() : raw.trim()
+              updated[i] = { ...updated[i], content }
+              sectionIdx++
+            }
+          }
+          return updated
+        })
+
         toast.success(
           action === 'enhance'
             ? 'Content enhanced by AI'
@@ -375,7 +409,7 @@ export function DocumentComposer({
                 onValueChange={(v) => handleDocTypeChange(v as DocumentType)}
               >
                 <SelectTrigger className="w-full">
-                  <SelectValue />
+                  <span className="text-sm">{DOC_TYPE_LABELS[docType] ?? docType}</span>
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="quick_note">Quick Note</SelectItem>

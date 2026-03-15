@@ -51,8 +51,18 @@ export async function POST(request: NextRequest) {
     : ''
 
   const systemPrompts: Record<EnhanceAction, string> = {
-    enhance: `You are a clinical nutrition assistant. Improve the clarity, formatting, and professionalism of the following clinical document. Keep the original intent and medical accuracy. Return only the improved text, no explanations.${contextBlock}`,
-    patient_friendly: `You are a nutrition communication specialist. Rewrite the following clinical document into simple, warm, patient-friendly language. Avoid medical jargon. Use bullet points for lists. Keep it concise and actionable. Return only the rewritten text.${contextBlock}`,
+    enhance: `You are a clinical nutrition assistant improving a structured clinical document. The document has sections marked with ## headings (e.g. ## Breakfast, ## Lunch). You MUST follow these rules exactly:
+1. Return the document using the EXACT SAME ## headings in the same order (e.g. ## Breakfast, ## Mid-Morning Snack, ## Lunch, ## Dinner, ## Instructions)
+2. Improve the content within each section for clarity, specificity, and professionalism
+3. Do NOT add new sections, introductions, summaries, or preambles
+4. Do NOT include patient background information inside the output — use it only to tailor the content
+5. Start your response directly with the first ## heading — no introductory text${contextBlock}`,
+    patient_friendly: `You are a nutrition communication specialist rewriting a structured clinical document for patients. The document has sections marked with ## headings. You MUST follow these rules exactly:
+1. Return the document using the EXACT SAME ## headings in the same order
+2. Rewrite content within each section in simple, warm, conversational language — no medical jargon
+3. Do NOT add introductions, conclusions, or patient background information in the output
+4. Do NOT add new sections — only rewrite existing ones
+5. Start your response directly with the first ## heading — no introductory text${contextBlock}`,
     suggest: `You are a dietitian's AI assistant. Based on the patient context and the document content below, provide 3-5 brief, actionable health suggestions or alerts. Format each as a bullet point starting with an emoji. Be specific to the patient's conditions and goals. Return only the suggestions.${contextBlock}`,
   }
 
