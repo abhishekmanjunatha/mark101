@@ -1,25 +1,19 @@
 /**
  * Client-side PDF generation utility.
  *
- * Approach:
- *   1. Accept the already-mounted preview DOM element (from a React ref)
- *   2. Deep-clone it so the live component is not disturbed
- *   3. Wrap the clone in a professional letterhead (header + footer) using
- *      inline styles so no stylesheet is required in the off-screen container
- *   4. Append the wrapper to document.body with `position:absolute;top:-99999px`
- *      — this puts it off-screen but still lets the browser compute layout,
- *      which is required for html2canvas.  Using `position:fixed` with a large
- *      negative z-index (the previous approach) prevented html2canvas from
- *      painting the element.
- *   5. Capture with html2canvas-pro → convert to jsPDF A4 PDF → save
+ * Strategy — per-page DOM capture:
+ *   • Each PDF page is built as a separate fixed-size (A4) off-screen div.
+ *   • Header appears ONLY on page 1 (letterhead).
+ *   • Footer appears on EVERY page (fixed to the bottom of each page div).
+ *   • Content is cloned for each page and translated upward by a computed
+ *     offset so that overflow:hidden on the clip container shows only the
+ *     slice belonging to that page.
+ *   • html2canvas-pro captures each page div — it handles Tailwind v4's
+ *     modern CSS color functions (lab, oklch, oklab) that plain html2canvas
+ *     cannot parse.
+ *   • jsPDF assembles the per-page JPEG images into an A4 PDF.
  *
- * html2canvas-pro is used instead of html2canvas because Tailwind v4 emits
- * computed CSS colors using modern CSS color functions (lab(), oklch(), oklab())
- * which the original html2canvas does not support, causing a console error and
- * blank/incorrect capture output.  html2canvas-pro adds full support for these
- * color spaces and is otherwise a drop-in replacement.
- *
- * Dynamic imports keep jsPDF / html2canvas-pro out of the SSR bundle entirely.
+ * Dynamic imports keep jsPDF / html2canvas-pro out of the SSR bundle.
  */
 
 export interface DietitianPDFData {
@@ -38,6 +32,13 @@ export interface DownloadPDFInput {
   previewElement: HTMLElement
 }
 
+// ── A4 page geometry (pixels at 96 dpi) ───────────────────────────────────
+const PAGE_W = 794   // 210 mm at 96 dpi
+const PAGE_H = 1123  // 297 mm at 96 dpi
+const MARGIN_X = 48  // left / right padding (px)
+const MARGIN_Y = 36  // top / bottom padding (px)
+const CONTENT_W = PAGE_W - MARGIN_X * 2   // 698 px
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function escapeHtml(str: string): string {
@@ -54,77 +55,124 @@ function formatTimestamp(): string {
     'January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December',
   ]
-  const day = d.getDate()
-  const month = months[d.getMonth()]
-  const year = d.getFullYear()
   const h24 = d.getHours()
   const h12 = h24 % 12 || 12
   const min = d.getMinutes().toString().padStart(2, '0')
   const ampm = h24 >= 12 ? 'PM' : 'AM'
-  return `${day} ${month} ${year} | ${h12}:${min} ${ampm}`
+  return `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()} | ${h12}:${min} ${ampm}`
 }
 
+/**
+ * Renders an HTML string inside a hidden div of the given width and returns
+ * its scrollHeight so we can calculate per-page content slice sizes.
+ */
+async function measureHtml(html: string, width: number): Promise<number> {
+  const div = document.createElement('div')
+  div.style.cssText = `position:absolute;top:-99999px;left:0;width:${width}px;font-family:Inter,Helvetica,Arial,sans-serif;`
+  div.innerHTML = html
+  document.body.appendChild(div)
+  await new Promise<void>((r) => setTimeout(r, 30))
+  const h = div.scrollHeight
+  document.body.removeChild(div)
+  return h
+}
+
+/**
+ * Deep-clones el, renders it in a hidden container of the given width, and
+ * returns its scrollHeight.
+ */
+async function measureElement(el: HTMLElement, width: number): Promise<number> {
+  const wrapper = document.createElement('div')
+  wrapper.style.cssText = `position:absolute;top:-99999px;left:0;width:${width}px;`
+  wrapper.appendChild(el.cloneNode(true))
+  document.body.appendChild(wrapper)
+  await new Promise<void>((r) => setTimeout(r, 30))
+  const h = wrapper.scrollHeight
+  document.body.removeChild(wrapper)
+  return h
+}
+
+// ── Header / Footer HTML builders ─────────────────────────────────────────
+
+/** Center-aligned clinical letterhead (page 1 only). */
 function buildHeaderHTML(d: DietitianPDFData): string {
   const rows: string[] = []
   if (d.name) {
-    rows.push(
-      `<div style="font-size:22px;font-weight:bold;color:#111111;margin-bottom:6px;">${escapeHtml(d.name)}</div>`
-    )
+    rows.push(`<div style="font-size:22px;font-weight:bold;color:#111111;margin-bottom:5px;">${escapeHtml(d.name)}</div>`)
   }
   if (d.qualification) {
-    rows.push(
-      `<div style="font-size:14px;color:#555555;margin-bottom:3px;">${escapeHtml(d.qualification)}</div>`
-    )
+    rows.push(`<div style="font-size:13px;color:#444444;margin-bottom:3px;">${escapeHtml(d.qualification)}</div>`)
   }
   if (d.licenseNumber) {
-    rows.push(
-      `<div style="font-size:14px;color:#555555;margin-bottom:3px;">License: ${escapeHtml(d.licenseNumber)}</div>`
-    )
+    rows.push(`<div style="font-size:13px;color:#555555;margin-bottom:3px;">License: ${escapeHtml(d.licenseNumber)}</div>`)
   }
   if (d.clinicName) {
-    rows.push(
-      `<div style="font-size:14px;color:#444444;">${escapeHtml(d.clinicName)}</div>`
-    )
+    rows.push(`<div style="font-size:13px;color:#444444;">${escapeHtml(d.clinicName)}</div>`)
   }
-  return `
-    <div style="text-align:center;padding-bottom:18px;border-bottom:1.5px solid #e2e8f0;margin-bottom:24px;">
-      ${rows.join('\n')}
-    </div>`
+  return `<div style="text-align:center;padding-bottom:14px;border-bottom:1.5px solid #555555;">${rows.join('')}</div>`
 }
 
+/** Center-aligned footer repeated on every page. */
 function buildFooterHTML(d: DietitianPDFData, timestamp: string): string {
   const rows: string[] = []
   if (d.clinicName) {
-    rows.push(
-      `<div style="font-size:13px;font-weight:600;color:#374151;margin-bottom:5px;">${escapeHtml(d.clinicName)}</div>`
-    )
+    rows.push(`<div style="font-size:13px;font-weight:600;color:#222222;margin-bottom:4px;">${escapeHtml(d.clinicName)}</div>`)
   }
   if (d.address) {
-    rows.push(
-      `<div style="font-size:12px;color:#666666;margin-bottom:2px;">Clinic Address: ${escapeHtml(d.address)}</div>`
-    )
+    rows.push(`<div style="font-size:12px;color:#555555;margin-bottom:2px;word-wrap:break-word;overflow-wrap:break-word;">Clinic Address: ${escapeHtml(d.address)}</div>`)
   }
   if (d.phone) {
-    rows.push(
-      `<div style="font-size:12px;color:#666666;margin-bottom:8px;">Phone: ${escapeHtml(d.phone)}</div>`
-    )
+    rows.push(`<div style="font-size:12px;color:#555555;margin-bottom:6px;">Phone: ${escapeHtml(d.phone)}</div>`)
   }
-  rows.push(
-    `<div style="font-size:11px;color:#94a3b8;margin-top:6px;">Generated via Peepal | ${timestamp}</div>`
-  )
-  return `
-    <div style="margin-top:40px;padding-top:16px;border-top:1.5px solid #e2e8f0;text-align:center;">
-      ${rows.join('\n')}
-    </div>`
+  rows.push(`<div style="font-size:11px;color:#888888;margin-top:4px;">Generated via Peepal | ${timestamp}</div>`)
+  return `<div style="border-top:1.5px solid #555555;padding-top:10px;text-align:center;">${rows.join('')}</div>`
+}
+
+// ── Preview content enhancements ──────────────────────────────────────────
+
+/**
+ * Applies inline style overrides directly to the cloned preview DOM node.
+ * The original preview element in the composer is never modified.
+ *
+ * Changes applied:
+ *   - Document title (h2): centered, bold, uppercase, prominent size
+ *   - Section headings (h3): bold, uppercase, dark color
+ *   - Root font-family: Inter
+ */
+function enhancePreviewClone(el: HTMLElement): void {
+  el.style.fontFamily = 'Inter,Helvetica,Arial,sans-serif'
+
+  const h2 = el.querySelector('h2') as HTMLElement | null
+  if (h2) {
+    h2.style.textAlign = 'center'
+    h2.style.fontWeight = 'bold'
+    h2.style.textTransform = 'uppercase'
+    h2.style.fontSize = '20px'
+    h2.style.color = '#111111'
+    h2.style.letterSpacing = '0.04em'
+    h2.style.marginTop = '8px'
+    h2.style.marginBottom = '20px'
+  }
+
+  el.querySelectorAll('h3').forEach((node) => {
+    const h = node as HTMLElement
+    h.style.fontWeight = 'bold'
+    h.style.textTransform = 'uppercase'
+    h.style.fontSize = '13px'
+    h.style.color = '#111111'
+    h.style.letterSpacing = '0.03em'
+    h.style.marginTop = '14px'
+    h.style.marginBottom = '4px'
+  })
 }
 
 // ── Main export ───────────────────────────────────────────────────────────
 
 /**
- * Clones the rendered preview element, wraps it in a clinical letterhead,
- * captures the result with html2canvas, and downloads it as an A4 PDF.
+ * Builds one PDF page at a time as a fixed A4-sized off-screen DOM node,
+ * captures it with html2canvas-pro, then assembles into a jsPDF document.
  *
- * Must be called from a browser environment (not SSR).
+ * Must be called from a browser environment (not during SSR).
  */
 export async function downloadDocumentAsPDF(input: DownloadPDFInput): Promise<void> {
   if (typeof window === 'undefined') {
@@ -134,91 +182,123 @@ export async function downloadDocumentAsPDF(input: DownloadPDFInput): Promise<vo
   const { docTitle, dietitian, previewElement } = input
   const timestamp = formatTimestamp()
 
-  // Dynamic import — deferred until first call, never included in the SSR bundle
-  // html2canvas-pro handles modern CSS color functions (lab, oklch, oklab) that
-  // Tailwind v4 emits in computed styles; plain html2canvas cannot parse them.
+  // Dynamic import — deferred until first call, not in SSR bundle
   const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
     import('jspdf'),
     import('html2canvas-pro'),
   ])
 
-  // ── Build off-screen wrapper ────────────────────────────────────────────
-  // position:absolute + large negative top keeps the wrapper out of the
-  // viewport while still allowing the browser to lay it out and paint it.
-  // This is required for html2canvas — position:fixed with z-index:-100
-  // (the previous approach) places the element behind the root stacking
-  // context, which prevents html2canvas from capturing it.
-  const wrapper = document.createElement('div')
-  wrapper.style.cssText = [
-    'position:absolute',
-    'top:-99999px',
-    'left:0',
-    'width:816px',
-    'background:#ffffff',
-    'font-family:Arial,Helvetica,sans-serif',
-    'padding:40px 48px',
-    'box-sizing:border-box',
-  ].join(';')
+  const headerHTML = buildHeaderHTML(dietitian)
+  const footerHTML = buildFooterHTML(dietitian, timestamp)
 
-  // Header — letterhead (inline-styled, no Tailwind dependency)
-  const headerEl = document.createElement('div')
-  headerEl.innerHTML = buildHeaderHTML(dietitian)
-  wrapper.appendChild(headerEl)
+  // Measure component heights so we can calculate content slice sizes
+  const [headerH, footerH, contentH] = await Promise.all([
+    measureHtml(headerHTML, CONTENT_W),
+    measureHtml(footerHTML, CONTENT_W),
+    measureElement(previewElement, CONTENT_W),
+  ])
 
-  // Document body — deep clone of the already-rendered preview.
-  // Tailwind CSS is in the global <head> stylesheet, so all utility classes
-  // on the cloned node still resolve correctly inside document.body.
-  const clonedPreview = previewElement.cloneNode(true) as HTMLElement
-  wrapper.appendChild(clonedPreview)
+  // Pixel positions (from page top) for content area boundaries
+  const HEADER_GAP = 14   // vertical gap between header divider and first content line
+  const FOOTER_GAP = 8    // vertical gap between last content line and footer divider
 
-  // Footer — clinic info + timestamp (inline-styled)
-  const footerEl = document.createElement('div')
-  footerEl.innerHTML = buildFooterHTML(dietitian, timestamp)
-  wrapper.appendChild(footerEl)
+  const contentTopP1   = MARGIN_Y + headerH + HEADER_GAP  // page 1 (below header)
+  const contentTopRest = MARGIN_Y                           // pages 2+ (below top margin)
+  const footerTopPx    = PAGE_H - MARGIN_Y - footerH        // where footer div starts
 
-  document.body.appendChild(wrapper)
+  const sliceHP1   = Math.max(footerTopPx - FOOTER_GAP - contentTopP1, 80)
+  const sliceHRest = Math.max(footerTopPx - FOOTER_GAP - contentTopRest, 80)
 
-  try {
-    // Allow the browser one event-loop tick to compute layout for the
-    // freshly-appended node before html2canvas reads its bounding rects.
-    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+  const totalPages =
+    contentH <= sliceHP1
+      ? 1
+      : 1 + Math.ceil((contentH - sliceHP1) / sliceHRest)
 
-    const canvas = await html2canvas(wrapper, {
-      scale: 2,
-      useCORS: true,
-      allowTaint: true,
-      backgroundColor: '#ffffff',
-      logging: false,
-      // Fix Tailwind responsive breakpoints by anchoring to the wrapper width
-      windowWidth: 816,
-    })
+  const pdf  = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+  const pdfW = pdf.internal.pageSize.getWidth()   // 210 mm
+  const pdfH = pdf.internal.pageSize.getHeight()  // 297 mm
 
-    const imgData = canvas.toDataURL('image/jpeg', 0.95)
-    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
-    const pageWidth = pdf.internal.pageSize.getWidth()   // 210 mm
-    const pageHeight = pdf.internal.pageSize.getHeight() // 297 mm
-    const imgHeightMM = (canvas.height * pageWidth) / canvas.width
+  for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
+    // How many pixels of content have already been shown on previous pages
+    const sliceOffset = pageIdx === 0 ? 0 : sliceHP1 + (pageIdx - 1) * sliceHRest
+    const contentTop  = pageIdx === 0 ? contentTopP1 : contentTopRest
+    const clipH       = Math.max(footerTopPx - FOOTER_GAP - contentTop, 50)
 
-    // Multi-page: stamp the full image, shift the vertical origin per page
-    let position = 0
-    let heightLeft = imgHeightMM
+    // ── Off-screen A4 page container ─────────────────────────────────
+    const pageDiv = document.createElement('div')
+    pageDiv.style.cssText = [
+      'position:absolute',
+      'top:-99999px',
+      'left:0',
+      `width:${PAGE_W}px`,
+      `height:${PAGE_H}px`,
+      'overflow:hidden',
+      'background:#ffffff',
+      'font-family:Inter,Helvetica,Arial,sans-serif',
+      'box-sizing:border-box',
+    ].join(';')
 
-    pdf.addImage(imgData, 'JPEG', 0, position, pageWidth, imgHeightMM)
-    heightLeft -= pageHeight
-    position -= pageHeight
-
-    while (heightLeft > 0) {
-      pdf.addPage()
-      pdf.addImage(imgData, 'JPEG', 0, position, pageWidth, imgHeightMM)
-      heightLeft -= pageHeight
-      position -= pageHeight
+    // Header — letterhead, FIRST PAGE ONLY
+    if (pageIdx === 0) {
+      const hDiv = document.createElement('div')
+      hDiv.style.cssText = `position:absolute;top:${MARGIN_Y}px;left:${MARGIN_X}px;right:${MARGIN_X}px;`
+      hDiv.innerHTML = headerHTML
+      pageDiv.appendChild(hDiv)
     }
 
-    const filename =
-      docTitle.trim().replace(/[^a-zA-Z0-9\s\-_]/g, '').replace(/\s+/g, '_') || 'document'
-    pdf.save(`${filename}.pdf`)
-  } finally {
-    // Always remove the off-screen node whether generation succeeded or failed
-    document.body.removeChild(wrapper)
+    // Content clip — overflow:hidden hides the out-of-slice portions
+    const clipDiv = document.createElement('div')
+    clipDiv.style.cssText = [
+      'position:absolute',
+      `top:${contentTop}px`,
+      `left:${MARGIN_X}px`,
+      `right:${MARGIN_X}px`,
+      `height:${clipH}px`,
+      'overflow:hidden',
+    ].join(';')
+
+    // Inner wrapper: translated up by sliceOffset to expose the correct slice
+    const innerDiv = document.createElement('div')
+    innerDiv.style.cssText = `position:relative;top:${-sliceOffset}px;width:100%;`
+    const cloned = previewElement.cloneNode(true) as HTMLElement
+    enhancePreviewClone(cloned)
+    innerDiv.appendChild(cloned)
+    clipDiv.appendChild(innerDiv)
+    pageDiv.appendChild(clipDiv)
+
+    // Footer — EVERY PAGE, absolutely positioned at the bottom
+    const fDiv = document.createElement('div')
+    fDiv.style.cssText = `position:absolute;bottom:${MARGIN_Y}px;left:${MARGIN_X}px;right:${MARGIN_X}px;`
+    fDiv.innerHTML = footerHTML
+    pageDiv.appendChild(fDiv)
+
+    document.body.appendChild(pageDiv)
+
+    try {
+      // Let the browser compute layout before html2canvas reads bounding rects
+      await new Promise<void>((r) => setTimeout(r, 50))
+
+      const canvas = await html2canvas(pageDiv, {
+        scale: 2,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+        windowWidth: PAGE_W,
+        width: PAGE_W,
+        height: PAGE_H,
+      })
+
+      if (pageIdx > 0) pdf.addPage()
+      pdf.addImage(canvas.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pdfW, pdfH)
+    } finally {
+      document.body.removeChild(pageDiv)
+    }
   }
+
+  const filename =
+    docTitle.trim().replace(/[^a-zA-Z0-9\s\-_]/g, '').replace(/\s+/g, '_') || 'document'
+  pdf.save(`${filename}.pdf`)
 }
+
+
