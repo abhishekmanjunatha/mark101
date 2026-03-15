@@ -27,7 +27,7 @@ export type DocumentType = 'quick_note' | 'meal_plan' | 'follow_up_recommendatio
 
 export type DocumentBlock = {
   id: string
-  type: 'title' | 'meal_section' | 'instructions' | 'custom'
+  type: 'title' | 'meal_section' | 'instructions' | 'custom' | 'patient_snapshot'
   label: string
   content: string
   order: number

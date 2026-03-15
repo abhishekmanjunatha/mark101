@@ -2,7 +2,7 @@ import { z } from 'zod'
 
 export const documentBlockSchema = z.object({
   id: z.string(),
-  type: z.enum(['title', 'meal_section', 'instructions', 'custom']),
+  type: z.enum(['title', 'meal_section', 'instructions', 'custom', 'patient_snapshot']),
   label: z.string().min(1, 'Label is required'),
   content: z.string(),
   order: z.number(),

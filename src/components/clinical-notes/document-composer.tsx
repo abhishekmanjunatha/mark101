@@ -18,6 +18,8 @@ import {
   ChevronDown,
   ChevronUp,
   User,
+  CheckCircle2,
+  RotateCcw,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -125,6 +127,75 @@ function computeAge(dob: string | null): string {
   return `${age} yrs`
 }
 
+function computeBMI(weight_kg: number | null, height_cm: number | null): string {
+  if (!weight_kg || !height_cm || height_cm === 0) return 'N/A'
+  const h = height_cm / 100
+  return (weight_kg / (h * h)).toFixed(1)
+}
+
+function computeIBW(height_cm: number | null, gender: string | null): string {
+  if (!height_cm) return 'N/A'
+  const heightInches = height_cm / 2.54
+  const excess = Math.max(0, heightInches - 60)
+  const ibw =
+    gender === 'male' ? 50 + 2.3 * excess
+    : gender === 'female' ? 45.5 + 2.3 * excess
+    : 47.75 + 2.3 * excess
+  return ibw.toFixed(1)
+}
+
+function computeWeightDiff(
+  weight_kg: number | null,
+  height_cm: number | null,
+  gender: string | null
+): string {
+  if (!weight_kg || !height_cm) return 'N/A'
+  const ibwStr = computeIBW(height_cm, gender)
+  if (ibwStr === 'N/A') return 'N/A'
+  const diff = weight_kg - parseFloat(ibwStr)
+  return (diff >= 0 ? '+' : '') + diff.toFixed(1) + ' kg'
+}
+
+interface PatientSnapshotData {
+  name: string
+  age: string
+  gender: string
+  height: string
+  weight: string
+  bmi: string
+  ibw: string
+  weightDiff: string
+  primaryGoal: string
+  activityLevel: string
+  medicalConditions: string
+  foodAllergies: string
+}
+
+function buildPatientSnapshotBlock(patient: PatientContext): DocumentBlock {
+  const ibwVal = computeIBW(patient.height_cm, patient.gender)
+  const snapshot: PatientSnapshotData = {
+    name: patient.full_name,
+    age: computeAge(patient.date_of_birth),
+    gender: patient.gender ?? 'N/A',
+    height: patient.height_cm ? `${patient.height_cm} cm` : 'N/A',
+    weight: patient.weight_kg ? `${patient.weight_kg} kg` : 'N/A',
+    bmi: computeBMI(patient.weight_kg, patient.height_cm),
+    ibw: ibwVal !== 'N/A' ? `${ibwVal} kg` : 'N/A',
+    weightDiff: computeWeightDiff(patient.weight_kg, patient.height_cm, patient.gender),
+    primaryGoal: patient.primary_goal?.replace(/_/g, ' ') ?? 'N/A',
+    activityLevel: patient.activity_level?.replace(/_/g, ' ') ?? 'N/A',
+    medicalConditions: patient.medical_conditions?.join(', ') || 'None',
+    foodAllergies: patient.food_allergies?.join(', ') || 'None',
+  }
+  return {
+    id: 'patient-snapshot',
+    type: 'patient_snapshot',
+    label: 'Patient Information',
+    content: JSON.stringify(snapshot),
+    order: -1,
+  }
+}
+
 // ── Component ──────────────────────────────────────────────────────────────
 
 export function DocumentComposer({
@@ -150,7 +221,10 @@ export function DocumentComposer({
   const [blocks, setBlocks] = useState<DocumentBlock[]>(() => {
     if (existingNote?.content) {
       const parsed = existingNote.content as unknown
-      if (Array.isArray(parsed)) return parsed as DocumentBlock[]
+      if (Array.isArray(parsed)) {
+        // Strip patient_snapshot blocks — they are regenerated fresh on every save
+        return (parsed as DocumentBlock[]).filter((b) => b.type !== 'patient_snapshot')
+      }
     }
     return defaultBlocksForType(
       (existingNote?.document_type as DocumentType) ?? 'meal_plan'
@@ -160,9 +234,12 @@ export function DocumentComposer({
   // AI state
   const [aiLoading, setAiLoading] = useState<string | null>(null)
   const [aiSuggestions, setAiSuggestions] = useState<string | null>(null)
+  // Staged AI result — shown in preview only until the user explicitly applies it
+  const [aiEnhancedBlocks, setAiEnhancedBlocks] = useState<DocumentBlock[] | null>(null)
+  const [aiRawResult, setAiRawResult] = useState<string | null>(null)
 
-  // Preview
-  const [showPreview, setShowPreview] = useState(false)
+  // Preview — open by default
+  const [showPreview, setShowPreview] = useState(true)
 
   // ── Fetch patient if pre-selected by URL or from existing note ──────
   useEffect(() => {
@@ -242,6 +319,8 @@ export function DocumentComposer({
     const hasContent = blocks.some((b) => b.content.trim())
     if (!hasContent) {
       setBlocks(defaultBlocksForType(type))
+      setAiEnhancedBlocks(null)
+      setAiRawResult(null)
     }
   }
 
@@ -257,6 +336,8 @@ export function DocumentComposer({
     }
 
     setAiLoading(action)
+    setAiEnhancedBlocks(null)
+    setAiRawResult(null)
     try {
       const res = await fetch('/api/ai/enhance-document', {
         method: 'POST',
@@ -290,8 +371,16 @@ export function DocumentComposer({
         setAiSuggestions(data.result ?? null)
       } else {
         const aiResult = data.result ?? ''
-        // Split on ## headings (the format we instruct the AI to use)
         const rawSections = aiResult.split(/^##\s+/m).filter(Boolean)
+
+        // Safety: AI returned unstructured text — show raw output only, never touch blocks
+        if (rawSections.length === 0) {
+          setAiRawResult(aiResult)
+          setAiEnhancedBlocks(null)
+          setShowPreview(true)
+          toast.success('AI output ready — review in preview below')
+          return
+        }
 
         // Build label→content map for label-based matching
         const sectionMap: Record<string, string> = {}
@@ -306,38 +395,37 @@ export function DocumentComposer({
           }
         }
 
-        const hasLabelMatches = Object.keys(sectionMap).length > 0
+        const hasLabelMatches = blocks.some(
+          (b) => b.type !== 'title' && b.label.toLowerCase() in sectionMap
+        )
 
-        setBlocks((prev) => {
-          if (hasLabelMatches) {
-            // Primary strategy: match blocks to AI sections by label name
-            return prev.map((b) => {
+        const enhanced = hasLabelMatches
+          ? blocks.map((b) => {
               if (b.type === 'title') return b
               const key = b.label.toLowerCase()
               return key in sectionMap ? { ...b, content: sectionMap[key] } : b
             })
-          }
-          // Fallback: AI ignored ## format — do positional mapping
-          const updated = [...prev]
-          let sectionIdx = 0
-          for (let i = 0; i < updated.length; i++) {
-            if (updated[i].type === 'title') continue
-            if (sectionIdx < rawSections.length) {
-              const raw = rawSections[sectionIdx]
-              const newlineIdx = raw.indexOf('\n')
-              const content = newlineIdx !== -1 ? raw.slice(newlineIdx + 1).trim() : raw.trim()
-              updated[i] = { ...updated[i], content }
-              sectionIdx++
-            }
-          }
-          return updated
-        })
+          : (() => {
+              // Positional fallback: map by index order
+              const updated = [...blocks]
+              let sectionIdx = 0
+              for (let i = 0; i < updated.length; i++) {
+                if (updated[i].type === 'title') continue
+                if (sectionIdx < rawSections.length) {
+                  const raw = rawSections[sectionIdx]
+                  const newlineIdx = raw.indexOf('\n')
+                  const content = newlineIdx !== -1 ? raw.slice(newlineIdx + 1).trim() : raw.trim()
+                  updated[i] = { ...updated[i], content }
+                  sectionIdx++
+                }
+              }
+              return updated
+            })()
 
-        toast.success(
-          action === 'enhance'
-            ? 'Content enhanced by AI'
-            : 'Converted to patient-friendly language'
-        )
+        // Stage in preview — original editor blocks remain unchanged
+        setAiEnhancedBlocks(enhanced)
+        setShowPreview(true)
+        toast.success('AI enhancement ready — review in preview, then apply')
       }
     } catch {
       toast.error('Failed to connect to AI service')
@@ -345,6 +433,21 @@ export function DocumentComposer({
       setAiLoading(null)
     }
   }
+
+  // ── Apply / Discard AI enhanced result ──────────────────────────────
+  const handleApplyAIChanges = useCallback(() => {
+    if (!aiEnhancedBlocks) return
+    setBlocks(aiEnhancedBlocks)
+    setAiEnhancedBlocks(null)
+    setAiRawResult(null)
+    toast.success('AI changes applied to editor')
+  }, [aiEnhancedBlocks])
+
+  const handleDiscardAIChanges = useCallback(() => {
+    setAiEnhancedBlocks(null)
+    setAiRawResult(null)
+    toast('AI changes discarded')
+  }, [])
 
   // ── Save ────────────────────────────────────────────────────────────
   const handleSave = () => {
@@ -356,10 +459,12 @@ export function DocumentComposer({
       toast.error('Please enter a document title')
       return
     }
-    // Update title block content to match docTitle
-    const finalBlocks = blocks.map((b) =>
+    // Update title block and prepend a patient snapshot for historical accuracy
+    const contentBlocks = blocks.map((b) =>
       b.type === 'title' ? { ...b, content: docTitle } : b
     )
+    const snapshotBlock = buildPatientSnapshotBlock(patient)
+    const finalBlocks = [snapshotBlock, ...contentBlocks]
 
     startTransition(async () => {
       const input = {
@@ -385,13 +490,20 @@ export function DocumentComposer({
   }
 
   // ── Compose content for preview ─────────────────────────────────────
-  const previewContent = blocks
-    .filter((b) => b.type !== 'title')
+  // When AI has a staged result, the preview shows it; the editor blocks are untouched
+  const previewBlocks = aiEnhancedBlocks ?? blocks
+  const previewContent = previewBlocks
+    .filter((b) => b.type !== 'title' && b.type !== 'patient_snapshot')
     .map(
       (b) =>
         `<h3 class="font-semibold text-sm mt-4 mb-1">${b.label}</h3><p class="text-sm whitespace-pre-wrap">${b.content || '<span class="text-muted-foreground italic">Empty</span>'}</p>`
     )
     .join('')
+
+  // Patient snapshot for preview header — always computed fresh from live patient state
+  const liveSnapshotData: PatientSnapshotData | null = patient
+    ? (JSON.parse(buildPatientSnapshotBlock(patient).content) as PatientSnapshotData)
+    : null
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -657,6 +769,42 @@ export function DocumentComposer({
               <div className="whitespace-pre-wrap text-amber-900">{aiSuggestions}</div>
             </div>
           )}
+
+          {/* AI enhancement pending — Apply or Discard */}
+          {(aiEnhancedBlocks || aiRawResult) && (
+            <div className="rounded-lg border border-violet-200 bg-violet-50 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-violet-600" />
+                <p className="text-sm font-medium text-violet-800">AI enhancement ready</p>
+              </div>
+              <p className="text-xs text-violet-700">
+                Your original content is unchanged. Review the preview below, then decide.
+              </p>
+              <div className="flex items-center gap-2">
+                {aiEnhancedBlocks && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={handleApplyAIChanges}
+                    className="bg-violet-600 hover:bg-violet-700 text-white gap-1.5"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    Apply AI Changes
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDiscardAIChanges}
+                  className="gap-1.5"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  Discard
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -681,15 +829,60 @@ export function DocumentComposer({
         </CardHeader>
         {showPreview && (
           <CardContent>
-            <div className="rounded-lg border bg-white p-6 space-y-1">
-              <h2 className="text-lg font-bold">
-                {docTitle || 'Untitled Document'}
-              </h2>
-              {patient && (
-                <p className="text-xs text-muted-foreground mb-3">
-                  Patient: {patient.full_name} ({patient.patient_code})
-                </p>
+            <div className="rounded-lg border bg-white p-6 space-y-4">
+              {/* AI indicator banner */}
+              {(aiEnhancedBlocks || aiRawResult) && (
+                <div className="flex items-center gap-2 rounded-md bg-violet-50 border border-violet-200 px-3 py-2">
+                  <Sparkles className="h-3.5 w-3.5 text-violet-600 shrink-0" />
+                  <span className="text-xs font-medium text-violet-700">
+                    {aiRawResult
+                      ? 'AI output (unstructured) — editor unchanged'
+                      : 'AI Enhanced Preview — your editor content is unchanged'}
+                  </span>
+                </div>
               )}
+
+              {/* Document title */}
+              <h2 className="text-xl font-bold leading-tight">
+                {docTitle || <span className="text-muted-foreground italic font-normal text-base">Untitled Document</span>}
+              </h2>
+
+              {/* Patient snapshot header */}
+              {liveSnapshotData && (
+                <div className="rounded-md border bg-slate-50 p-4 space-y-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Patient Information</p>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1.5">
+                    {[
+                      { label: 'Name', value: liveSnapshotData.name },
+                      { label: 'Age', value: liveSnapshotData.age },
+                      { label: 'Gender', value: liveSnapshotData.gender },
+                      { label: 'Height', value: liveSnapshotData.height },
+                      { label: 'Current Weight', value: liveSnapshotData.weight },
+                      { label: 'BMI', value: liveSnapshotData.bmi },
+                      { label: 'Ideal Body Weight', value: liveSnapshotData.ibw },
+                      { label: 'Weight Difference', value: liveSnapshotData.weightDiff },
+                      { label: 'Primary Goal', value: liveSnapshotData.primaryGoal },
+                      { label: 'Activity Level', value: liveSnapshotData.activityLevel },
+                      { label: 'Medical Conditions', value: liveSnapshotData.medicalConditions },
+                      { label: 'Food Allergies', value: liveSnapshotData.foodAllergies },
+                    ].map((item) => (
+                      <div key={item.label}>
+                        <p className="text-xs text-muted-foreground">{item.label}</p>
+                        <p className="text-xs font-medium capitalize">{item.value}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Unstructured AI output (raw fallback) */}
+              {aiRawResult && (
+                <div className="rounded-md border bg-violet-50 p-4 text-sm text-violet-900 whitespace-pre-wrap">
+                  {aiRawResult}
+                </div>
+              )}
+
+              {/* Document sections */}
               <div
                 className="prose prose-sm max-w-none"
                 dangerouslySetInnerHTML={{ __html: previewContent }}
