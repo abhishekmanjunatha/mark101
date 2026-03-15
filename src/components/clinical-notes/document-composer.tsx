@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useCallback, useEffect } from 'react'
+import { useState, useTransition, useCallback, useEffect, useRef } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import {
   Plus,
@@ -260,6 +260,8 @@ export function DocumentComposer({
 
   // Preview — open by default
   const [showPreview, setShowPreview] = useState(true)
+  // Stable ref to the rendered preview content div — used for PDF capture
+  const previewContentRef = useRef<HTMLDivElement>(null)
 
   // Visit measurements — stored as strings for controlled inputs
   const [visitHeight, setVisitHeight] = useState<string>('')
@@ -491,38 +493,35 @@ export function DocumentComposer({
   const handleDownloadPDF = async () => {
     if (!patient) { toast.error('No patient selected'); return }
     if (!docTitle.trim()) { toast.error('Please enter a document title'); return }
+
+    // Ensure the preview section is open so the DOM node is mounted
+    if (!showPreview) {
+      setShowPreview(true)
+      // Wait one tick for React to flush the state update and mount the element
+      await new Promise<void>((resolve) => setTimeout(resolve, 150))
+    }
+
+    const previewEl = previewContentRef.current
+    if (!previewEl) {
+      toast.error('Preview is not available — please expand the preview section and try again.')
+      return
+    }
+
     setPdfPending(true)
     try {
       const [saveResult, dtData] = await Promise.all([performSave(), fetchDietitianData()])
       if (saveResult.error) { toast.error(saveResult.error); return }
 
-      // Compute snapshot at click-time (same logic as liveSnapshotData in render)
-      const vH = visitHeight && !isNaN(parseFloat(visitHeight)) ? parseFloat(visitHeight) : undefined
-      const vW = visitWeight && !isNaN(parseFloat(visitWeight)) ? parseFloat(visitWeight) : undefined
-      const snapshotForPDF = patient
-        ? (JSON.parse(
-            buildPatientSnapshotBlock(patient, {
-              visitHeight: vH,
-              visitWeight: vW,
-              previousWeight: originalWeight !== undefined ? originalWeight : undefined,
-            }).content
-          ) as PatientSnapshotData)
-        : null
-
-      const sectionsForPDF = (aiEnhancedBlocks ?? blocks)
-        .filter((b) => b.type !== 'title' && b.type !== 'patient_snapshot')
-        .map((b) => ({ label: b.label, content: b.content }))
-
       await downloadDocumentAsPDF({
         docTitle,
         dietitian: dtData,
-        snapshot: snapshotForPDF,
-        sections: sectionsForPDF,
+        previewElement: previewEl,
       })
       toast.success('PDF downloaded successfully')
       router.push('/clinical-notes')
       router.refresh()
-    } catch {
+    } catch (err) {
+      console.error('[PDF] generation error:', err)
       toast.error('Failed to generate PDF')
     } finally {
       setPdfPending(false)
@@ -1155,7 +1154,7 @@ export function DocumentComposer({
         </CardHeader>
         {showPreview && (
           <CardContent>
-            <div className="rounded-lg border bg-white p-6 space-y-4">
+            <div ref={previewContentRef} className="rounded-lg border bg-white p-6 space-y-4">
               {/* AI indicator banner */}
               {(aiEnhancedBlocks || aiRawResult) && (
                 <div className="flex items-center gap-2 rounded-md bg-violet-50 border border-violet-200 px-3 py-2">

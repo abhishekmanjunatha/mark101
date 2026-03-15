@@ -1,7 +1,19 @@
 /**
  * Client-side PDF generation utility.
- * Uses html2canvas + jsPDF to convert an off-screen DOM node to a PDF download.
- * Imported only from client components — never executed server-side.
+ *
+ * Approach:
+ *   1. Accept the already-mounted preview DOM element (from a React ref)
+ *   2. Deep-clone it so the live component is not disturbed
+ *   3. Wrap the clone in a professional letterhead (header + footer) using
+ *      inline styles so no stylesheet is required in the off-screen container
+ *   4. Append the wrapper to document.body with `position:absolute;top:-99999px`
+ *      — this puts it off-screen but still lets the browser compute layout,
+ *      which is required for html2canvas.  Using `position:fixed` with a large
+ *      negative z-index (the previous approach) prevented html2canvas from
+ *      painting the element.
+ *   5. Capture with html2canvas → convert to jsPDF A4 PDF → save
+ *
+ * Dynamic imports keep jsPDF / html2canvas out of the SSR bundle entirely.
  */
 
 export interface DietitianPDFData {
@@ -13,33 +25,11 @@ export interface DietitianPDFData {
   phone: string
 }
 
-export interface PDFSectionData {
-  label: string
-  content: string
-}
-
-export interface PDFSnapshotData {
-  name: string
-  age: string
-  gender: string
-  height: string
-  weight: string
-  bmi: string
-  ibw: string
-  weightDiff: string
-  previousWeight: string
-  weightChange: string
-  primaryGoal: string
-  activityLevel: string
-  medicalConditions: string
-  foodAllergies: string
-}
-
 export interface DownloadPDFInput {
   docTitle: string
   dietitian: DietitianPDFData
-  snapshot: PDFSnapshotData | null
-  sections: PDFSectionData[]
+  /** The mounted preview container DOM element obtained from a React ref. */
+  previewElement: HTMLElement
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -68,147 +58,131 @@ function formatTimestamp(): string {
   return `${day} ${month} ${year} | ${h12}:${min} ${ampm}`
 }
 
-function buildSnapshotTableHTML(snap: PDFSnapshotData): string {
-  const fields: [string, string][] = [
-    ['Name', snap.name],
-    ['Age', snap.age],
-    ['Gender', snap.gender],
-    ['Height', snap.height],
-    ['Current Weight', snap.weight],
-    ['BMI', snap.bmi],
-    ['Ideal Body Weight', snap.ibw],
-    ['Weight Difference', snap.weightDiff],
-    ['Prev. Visit Weight', snap.previousWeight],
-    ['Weight Change', snap.weightChange],
-    ['Primary Goal', snap.primaryGoal],
-    ['Activity Level', snap.activityLevel],
-    ['Medical Conditions', snap.medicalConditions],
-    ['Food Allergies', snap.foodAllergies],
-  ]
-
-  let rows = ''
-  for (let i = 0; i < fields.length; i += 3) {
-    const cells = fields.slice(i, i + 3)
-    // Pad to 3 columns
-    while (cells.length < 3) cells.push(['', ''])
-    rows += `<tr>${cells
-      .map(
-        ([label, value]) => `
-      <td style="width:33%;padding:4px 8px;vertical-align:top;">
-        <div style="font-size:10px;color:#94a3b8;margin-bottom:1px;">${escapeHtml(label)}</div>
-        <div style="font-size:12px;font-weight:500;color:#1e293b;text-transform:capitalize;">${escapeHtml(value)}</div>
-      </td>`
-      )
-      .join('')}</tr>`
+function buildHeaderHTML(d: DietitianPDFData): string {
+  const rows: string[] = []
+  if (d.name) {
+    rows.push(
+      `<div style="font-size:22px;font-weight:bold;color:#111111;margin-bottom:6px;">${escapeHtml(d.name)}</div>`
+    )
   }
-  return `<table style="width:100%;border-collapse:collapse;">${rows}</table>`
+  if (d.qualification) {
+    rows.push(
+      `<div style="font-size:14px;color:#555555;margin-bottom:3px;">${escapeHtml(d.qualification)}</div>`
+    )
+  }
+  if (d.licenseNumber) {
+    rows.push(
+      `<div style="font-size:14px;color:#555555;margin-bottom:3px;">License: ${escapeHtml(d.licenseNumber)}</div>`
+    )
+  }
+  if (d.clinicName) {
+    rows.push(
+      `<div style="font-size:14px;color:#444444;">${escapeHtml(d.clinicName)}</div>`
+    )
+  }
+  return `
+    <div style="text-align:center;padding-bottom:18px;border-bottom:1.5px solid #e2e8f0;margin-bottom:24px;">
+      ${rows.join('\n')}
+    </div>`
 }
 
-function buildPDFHTML(input: DownloadPDFInput, timestamp: string): string {
-  const { docTitle, dietitian, snapshot, sections } = input
-
-  // ── Header ───────────────────────────────────────────────────────────
-  const qualLine = dietitian.qualification
-    ? `<div style="font-size:14px;color:#555;margin-bottom:3px;">${escapeHtml(dietitian.qualification)}</div>`
-    : ''
-  const licenseLine = dietitian.licenseNumber
-    ? `<div style="font-size:14px;color:#555;margin-bottom:3px;">License: ${escapeHtml(dietitian.licenseNumber)}</div>`
-    : ''
-  const clinicHeaderLine = dietitian.clinicName
-    ? `<div style="font-size:14px;color:#444;margin-bottom:0;">${escapeHtml(dietitian.clinicName)}</div>`
-    : ''
-
-  // ── Patient snapshot ─────────────────────────────────────────────────
-  const snapshotHTML = snapshot
-    ? `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px;margin-bottom:20px;">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#94a3b8;margin-bottom:10px;">Patient Information</div>
-        ${buildSnapshotTableHTML(snapshot)}
-      </div>`
-    : ''
-
-  // ── Document sections ────────────────────────────────────────────────
-  const sectionsHTML = sections
-    .map(
-      (s) => `
-    <div style="margin-bottom:18px;">
-      <div style="font-size:13px;font-weight:600;color:#1e293b;padding-bottom:5px;border-bottom:1px solid #f1f5f9;margin-bottom:8px;">${escapeHtml(s.label)}</div>
-      <div style="font-size:13px;color:#374151;white-space:pre-wrap;line-height:1.65;">${escapeHtml(s.content || 'Empty')}</div>
-    </div>`
+function buildFooterHTML(d: DietitianPDFData, timestamp: string): string {
+  const rows: string[] = []
+  if (d.clinicName) {
+    rows.push(
+      `<div style="font-size:13px;font-weight:600;color:#374151;margin-bottom:5px;">${escapeHtml(d.clinicName)}</div>`
     )
-    .join('')
-
-  // ── Footer ───────────────────────────────────────────────────────────
-  const clinicFooterLine = dietitian.clinicName
-    ? `<div style="font-size:13px;font-weight:600;color:#374151;margin-bottom:5px;">${escapeHtml(dietitian.clinicName)}</div>`
-    : ''
-  const addressLine = dietitian.address
-    ? `<div style="font-size:12px;color:#666;margin-bottom:2px;">Clinic Address: ${escapeHtml(dietitian.address)}</div>`
-    : ''
-  const phoneLine = dietitian.phone
-    ? `<div style="font-size:12px;color:#666;margin-bottom:8px;">Phone: ${escapeHtml(dietitian.phone)}</div>`
-    : ''
-
+  }
+  if (d.address) {
+    rows.push(
+      `<div style="font-size:12px;color:#666666;margin-bottom:2px;">Clinic Address: ${escapeHtml(d.address)}</div>`
+    )
+  }
+  if (d.phone) {
+    rows.push(
+      `<div style="font-size:12px;color:#666666;margin-bottom:8px;">Phone: ${escapeHtml(d.phone)}</div>`
+    )
+  }
+  rows.push(
+    `<div style="font-size:11px;color:#94a3b8;margin-top:6px;">Generated via Peepal | ${timestamp}</div>`
+  )
   return `
-    <div style="font-family:Arial,Helvetica,sans-serif;background:#ffffff;padding:40px 48px;width:714px;color:#111111;">
-
-      <!-- HEADER (center-aligned) -->
-      <div style="text-align:center;padding-bottom:18px;border-bottom:1.5px solid #e2e8f0;margin-bottom:24px;">
-        <div style="font-size:22px;font-weight:bold;color:#111111;margin-bottom:6px;">${escapeHtml(dietitian.name || 'Dietitian')}</div>
-        ${qualLine}
-        ${licenseLine}
-        ${clinicHeaderLine}
-      </div>
-
-      <!-- DOCUMENT TITLE -->
-      <h1 style="font-size:18px;font-weight:bold;color:#111111;margin:0 0 16px 0;">${escapeHtml(docTitle)}</h1>
-
-      <!-- PATIENT INFORMATION -->
-      ${snapshotHTML}
-
-      <!-- DOCUMENT SECTIONS -->
-      ${sectionsHTML}
-
-      <!-- FOOTER (center-aligned) -->
-      <div style="margin-top:40px;padding-top:16px;border-top:1.5px solid #e2e8f0;text-align:center;">
-        ${clinicFooterLine}
-        ${addressLine}
-        ${phoneLine}
-        <div style="font-size:11px;color:#94a3b8;margin-top:6px;">Generated via Peepal | ${timestamp}</div>
-      </div>
-
+    <div style="margin-top:40px;padding-top:16px;border-top:1.5px solid #e2e8f0;text-align:center;">
+      ${rows.join('\n')}
     </div>`
 }
 
 // ── Main export ───────────────────────────────────────────────────────────
 
 /**
- * Generates and downloads a professionally-formatted PDF from the current
- * document state. Dynamic imports ensure jsPDF / html2canvas are only
- * bundled and loaded on the client when this function is actually called.
+ * Clones the rendered preview element, wraps it in a clinical letterhead,
+ * captures the result with html2canvas, and downloads it as an A4 PDF.
+ *
+ * Must be called from a browser environment (not SSR).
  */
 export async function downloadDocumentAsPDF(input: DownloadPDFInput): Promise<void> {
-  // Dynamic import — client-only, deferred until needed
+  if (typeof window === 'undefined') {
+    throw new Error('PDF generation is only available in the browser')
+  }
+
+  const { docTitle, dietitian, previewElement } = input
+  const timestamp = formatTimestamp()
+
+  // Dynamic import — deferred until first call, never included in the SSR bundle
   const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
     import('jspdf'),
     import('html2canvas'),
   ])
 
-  const timestamp = formatTimestamp()
+  // ── Build off-screen wrapper ────────────────────────────────────────────
+  // position:absolute + large negative top keeps the wrapper out of the
+  // viewport while still allowing the browser to lay it out and paint it.
+  // This is required for html2canvas — position:fixed with z-index:-100
+  // (the previous approach) places the element behind the root stacking
+  // context, which prevents html2canvas from capturing it.
+  const wrapper = document.createElement('div')
+  wrapper.style.cssText = [
+    'position:absolute',
+    'top:-99999px',
+    'left:0',
+    'width:816px',
+    'background:#ffffff',
+    'font-family:Arial,Helvetica,sans-serif',
+    'padding:40px 48px',
+    'box-sizing:border-box',
+  ].join(';')
 
-  // Build off-screen container
-  const container = document.createElement('div')
-  container.style.cssText =
-    'position:fixed;left:-9999px;top:0;width:794px;background:#ffffff;z-index:-100;'
-  container.innerHTML = buildPDFHTML(input, timestamp)
-  document.body.appendChild(container)
+  // Header — letterhead (inline-styled, no Tailwind dependency)
+  const headerEl = document.createElement('div')
+  headerEl.innerHTML = buildHeaderHTML(dietitian)
+  wrapper.appendChild(headerEl)
+
+  // Document body — deep clone of the already-rendered preview.
+  // Tailwind CSS is in the global <head> stylesheet, so all utility classes
+  // on the cloned node still resolve correctly inside document.body.
+  const clonedPreview = previewElement.cloneNode(true) as HTMLElement
+  wrapper.appendChild(clonedPreview)
+
+  // Footer — clinic info + timestamp (inline-styled)
+  const footerEl = document.createElement('div')
+  footerEl.innerHTML = buildFooterHTML(dietitian, timestamp)
+  wrapper.appendChild(footerEl)
+
+  document.body.appendChild(wrapper)
 
   try {
-    const canvas = await html2canvas(container, {
+    // Allow the browser one event-loop tick to compute layout for the
+    // freshly-appended node before html2canvas reads its bounding rects.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+
+    const canvas = await html2canvas(wrapper, {
       scale: 2,
       useCORS: true,
+      allowTaint: true,
       backgroundColor: '#ffffff',
-      width: 794,
       logging: false,
+      // Fix Tailwind responsive breakpoints by anchoring to the wrapper width
+      windowWidth: 816,
     })
 
     const imgData = canvas.toDataURL('image/jpeg', 0.95)
@@ -217,7 +191,7 @@ export async function downloadDocumentAsPDF(input: DownloadPDFInput): Promise<vo
     const pageHeight = pdf.internal.pageSize.getHeight() // 297 mm
     const imgHeightMM = (canvas.height * pageWidth) / canvas.width
 
-    // Multi-page: shift image vertically on each subsequent page
+    // Multi-page: stamp the full image, shift the vertical origin per page
     let position = 0
     let heightLeft = imgHeightMM
 
@@ -232,12 +206,11 @@ export async function downloadDocumentAsPDF(input: DownloadPDFInput): Promise<vo
       position -= pageHeight
     }
 
-    // Sanitise filename — strip characters that are invalid in filenames
     const filename =
-      input.docTitle.trim().replace(/[^a-zA-Z0-9\s\-_]/g, '').replace(/\s+/g, '_') ||
-      'document'
+      docTitle.trim().replace(/[^a-zA-Z0-9\s\-_]/g, '').replace(/\s+/g, '_') || 'document'
     pdf.save(`${filename}.pdf`)
   } finally {
-    document.body.removeChild(container)
+    // Always remove the off-screen node whether generation succeeded or failed
+    document.body.removeChild(wrapper)
   }
 }
