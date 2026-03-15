@@ -18,6 +18,7 @@ import {
   ChevronDown,
   ChevronUp,
   User,
+  Ruler,
   CheckCircle2,
   RotateCcw,
 } from 'lucide-react'
@@ -39,7 +40,7 @@ import { cn } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
 import { createClinicalNote, updateClinicalNote } from '@/actions/clinical-notes'
 import type { DocumentType, DocumentBlock } from '@/types/app'
-import type { Tables } from '@/types/database'
+import type { Tables, Json } from '@/types/database'
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -169,23 +170,39 @@ interface PatientSnapshotData {
   activityLevel: string
   medicalConditions: string
   foodAllergies: string
+  previousWeight: string
+  weightChange: string
 }
 
-function buildPatientSnapshotBlock(patient: PatientContext): DocumentBlock {
-  const ibwVal = computeIBW(patient.height_cm, patient.gender)
+function buildPatientSnapshotBlock(
+  patient: PatientContext,
+  opts?: { visitHeight?: number; visitWeight?: number; previousWeight?: number | null }
+): DocumentBlock {
+  const h = (opts?.visitHeight != null && !isNaN(opts.visitHeight)) ? opts.visitHeight : patient.height_cm
+  const w = (opts?.visitWeight != null && !isNaN(opts.visitWeight)) ? opts.visitWeight : patient.weight_kg
+  const prevW = opts !== undefined
+    ? (opts.previousWeight !== undefined ? opts.previousWeight : patient.weight_kg)
+    : patient.weight_kg
+  const ibwVal = computeIBW(h, patient.gender)
+  const weightChangeVal =
+    w != null && prevW != null && Math.abs(w - prevW) > 0.01
+      ? (w >= prevW ? '+' : '') + (w - prevW).toFixed(1) + ' kg'
+      : 'N/A'
   const snapshot: PatientSnapshotData = {
     name: patient.full_name,
     age: computeAge(patient.date_of_birth),
     gender: patient.gender ?? 'N/A',
-    height: patient.height_cm ? `${patient.height_cm} cm` : 'N/A',
-    weight: patient.weight_kg ? `${patient.weight_kg} kg` : 'N/A',
-    bmi: computeBMI(patient.weight_kg, patient.height_cm),
+    height: h ? `${h} cm` : 'N/A',
+    weight: w ? `${w} kg` : 'N/A',
+    bmi: computeBMI(w, h),
     ibw: ibwVal !== 'N/A' ? `${ibwVal} kg` : 'N/A',
-    weightDiff: computeWeightDiff(patient.weight_kg, patient.height_cm, patient.gender),
+    weightDiff: computeWeightDiff(w, h, patient.gender),
     primaryGoal: patient.primary_goal?.replace(/_/g, ' ') ?? 'N/A',
     activityLevel: patient.activity_level?.replace(/_/g, ' ') ?? 'N/A',
     medicalConditions: patient.medical_conditions?.join(', ') || 'None',
     foodAllergies: patient.food_allergies?.join(', ') || 'None',
+    previousWeight: prevW != null ? `${prevW} kg` : 'N/A',
+    weightChange: weightChangeVal,
   }
   return {
     id: 'patient-snapshot',
@@ -241,6 +258,13 @@ export function DocumentComposer({
   // Preview — open by default
   const [showPreview, setShowPreview] = useState(true)
 
+  // Visit measurements — stored as strings for controlled inputs
+  const [visitHeight, setVisitHeight] = useState<string>('')
+  const [visitWeight, setVisitWeight] = useState<string>('')
+  // The weight recorded at the start of this session (reference for weight change)
+  const [originalWeight, setOriginalWeight] = useState<number | null | undefined>(undefined)
+  const [isSavingMeasurements, setIsSavingMeasurements] = useState(false)
+
   // ── Fetch patient if pre-selected by URL or from existing note ──────
   useEffect(() => {
     if (patient) return
@@ -259,6 +283,14 @@ export function DocumentComposer({
     }
     fetchPatient()
   }, [preselectedPatientId, existingNote?.patient_id, patient])
+
+  // ── Initialize visit measurements once when patient becomes available ──
+  useEffect(() => {
+    if (!patient) return
+    setVisitHeight((prev) => prev === '' ? (patient.height_cm?.toString() ?? '') : prev)
+    setVisitWeight((prev) => prev === '' ? (patient.weight_kg?.toString() ?? '') : prev)
+    setOriginalWeight((prev) => prev !== undefined ? prev : patient.weight_kg)
+  }, [patient?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Block management ────────────────────────────────────────────────
   const updateBlockContent = useCallback(
@@ -349,8 +381,8 @@ export function DocumentComposer({
             ? {
                 age: computeAge(patient.date_of_birth),
                 gender: patient.gender,
-                height_cm: patient.height_cm,
-                weight_kg: patient.weight_kg,
+                height_cm: (visitHeight && !isNaN(parseFloat(visitHeight))) ? parseFloat(visitHeight) : patient.height_cm,
+                weight_kg: (visitWeight && !isNaN(parseFloat(visitWeight))) ? parseFloat(visitWeight) : patient.weight_kg,
                 primary_goal: patient.primary_goal,
                 activity_level: patient.activity_level,
                 dietary_type: patient.dietary_type,
@@ -449,6 +481,73 @@ export function DocumentComposer({
     toast('AI changes discarded')
   }, [])
 
+  // ── Save visit measurements to patient profile ────────────────────────
+  const handleSaveMeasurements = async () => {
+    if (!patient) return
+    const h = visitHeight.trim() ? parseFloat(visitHeight) : undefined
+    const w = visitWeight.trim() ? parseFloat(visitWeight) : undefined
+
+    if (h !== undefined && (isNaN(h) || h < 50 || h > 270)) {
+      toast.error('Enter a valid height between 50 and 270 cm')
+      return
+    }
+    if (w !== undefined && (isNaN(w) || w < 20 || w > 350)) {
+      toast.error('Enter a valid weight between 20 and 350 kg')
+      return
+    }
+
+    const updates: { height_cm?: number; weight_kg?: number } = {}
+    if (h !== undefined && h !== patient.height_cm) updates.height_cm = h
+    if (w !== undefined && w !== patient.weight_kg) updates.weight_kg = w
+
+    if (Object.keys(updates).length === 0) {
+      toast('Measurements match what is already on file')
+      return
+    }
+
+    setIsSavingMeasurements(true)
+    try {
+      const supabase = createClient()
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) { toast.error('Session expired'); return }
+
+      const { error } = await supabase
+        .from('patients')
+        .update(updates)
+        .eq('id', patient.id)
+        .eq('dietitian_id', user.id)
+
+      if (error) { toast.error('Failed to save: ' + error.message); return }
+
+      // Timeline event for weight change
+      if (updates.weight_kg !== undefined) {
+        const prevW = patient.weight_kg ?? 0
+        const newW = updates.weight_kg
+        const diff = newW - prevW
+        const sign = diff >= 0 ? '+' : ''
+        await supabase.from('timeline_events').insert({
+          dietitian_id: user.id,
+          patient_id: patient.id,
+          event_type: 'weight_updated',
+          event_data: {
+            previous_weight_kg: prevW,
+            new_weight_kg: newW,
+            change: `${sign}${diff.toFixed(1)} kg`,
+            note: `Weight updated: ${prevW} kg → ${newW} kg (${sign}${diff.toFixed(1)} kg)`,
+          } as unknown as Json,
+        })
+      }
+
+      // Reflect updates in local patient state so BMI/IBW/snapshot recalculate
+      setPatient((prev) => prev ? { ...prev, ...updates } : prev)
+      toast.success('Measurements saved to patient profile')
+    } catch {
+      toast.error('Failed to save measurements')
+    } finally {
+      setIsSavingMeasurements(false)
+    }
+  }
+
   // ── Save ────────────────────────────────────────────────────────────
   const handleSave = () => {
     if (!patient) {
@@ -463,7 +562,13 @@ export function DocumentComposer({
     const contentBlocks = blocks.map((b) =>
       b.type === 'title' ? { ...b, content: docTitle } : b
     )
-    const snapshotBlock = buildPatientSnapshotBlock(patient)
+    const visitH = visitHeight && !isNaN(parseFloat(visitHeight)) ? parseFloat(visitHeight) : undefined
+    const visitW = visitWeight && !isNaN(parseFloat(visitWeight)) ? parseFloat(visitWeight) : undefined
+    const snapshotBlock = buildPatientSnapshotBlock(patient, {
+      visitHeight: visitH,
+      visitWeight: visitW,
+      previousWeight: originalWeight !== undefined ? originalWeight : undefined,
+    })
     const finalBlocks = [snapshotBlock, ...contentBlocks]
 
     startTransition(async () => {
@@ -500,9 +605,15 @@ export function DocumentComposer({
     )
     .join('')
 
-  // Patient snapshot for preview header — always computed fresh from live patient state
+  // Parsed visit measurements for snapshot + preview (recomputed each render)
+  const visitH = visitHeight && !isNaN(parseFloat(visitHeight)) ? parseFloat(visitHeight) : undefined
+  const visitW = visitWeight && !isNaN(parseFloat(visitWeight)) ? parseFloat(visitWeight) : undefined
   const liveSnapshotData: PatientSnapshotData | null = patient
-    ? (JSON.parse(buildPatientSnapshotBlock(patient).content) as PatientSnapshotData)
+    ? (JSON.parse(buildPatientSnapshotBlock(patient, {
+        visitHeight: visitH,
+        visitWeight: visitW,
+        previousWeight: originalWeight !== undefined ? originalWeight : undefined,
+      }).content) as PatientSnapshotData)
     : null
 
   return (
@@ -610,6 +721,115 @@ export function DocumentComposer({
                 ))}
               </div>
             )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ══════════════ Section 2b: Visit Measurements ══════════════ */}
+      {patient && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Ruler className="h-4 w-4 text-emerald-600" />
+              Visit Measurements
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              Record today's measurements. Click <strong>Save Measurements</strong> to update the patient profile and log the weight change to the timeline.
+            </p>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="visit-height">Height (cm)</Label>
+                <Input
+                  id="visit-height"
+                  type="number"
+                  min={50}
+                  max={270}
+                  step={0.1}
+                  placeholder={patient.height_cm?.toString() ?? 'e.g. 165'}
+                  value={visitHeight}
+                  onChange={(e) => setVisitHeight(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <Label htmlFor="visit-weight">Weight (kg)</Label>
+                  {visitWeight && patient.weight_kg !== null &&
+                    !isNaN(parseFloat(visitWeight)) &&
+                    Math.abs(parseFloat(visitWeight) - (patient.weight_kg ?? 0)) > 0.01 && (
+                    <span className={cn(
+                      'text-xs font-medium',
+                      parseFloat(visitWeight) < (patient.weight_kg ?? 0) ? 'text-emerald-600' : 'text-amber-600'
+                    )}>
+                      {parseFloat(visitWeight) < (patient.weight_kg ?? 0) ? '▼' : '▲'}{' '}
+                      {Math.abs(parseFloat(visitWeight) - (patient.weight_kg ?? 0)).toFixed(1)} kg
+                    </span>
+                  )}
+                </div>
+                <Input
+                  id="visit-weight"
+                  type="number"
+                  min={20}
+                  max={350}
+                  step={0.1}
+                  placeholder={patient.weight_kg?.toString() ?? 'e.g. 65'}
+                  value={visitWeight}
+                  onChange={(e) => setVisitWeight(e.target.value)}
+                />
+                {originalWeight !== undefined && originalWeight !== null && (
+                  <p className="text-xs text-muted-foreground">Previous: {originalWeight} kg</p>
+                )}
+              </div>
+            </div>
+
+            {/* Live BMI / IBW preview */}
+            {visitWeight && visitHeight &&
+              !isNaN(parseFloat(visitWeight)) && !isNaN(parseFloat(visitHeight)) && (
+              <div className="flex flex-wrap gap-4 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                <span>
+                  BMI:{' '}
+                  <strong className="text-foreground">
+                    {computeBMI(parseFloat(visitWeight), parseFloat(visitHeight))}
+                  </strong>
+                </span>
+                <span>
+                  Ideal Body Weight:{' '}
+                  <strong className="text-foreground">
+                    {computeIBW(parseFloat(visitHeight), patient.gender) !== 'N/A'
+                      ? `${computeIBW(parseFloat(visitHeight), patient.gender)} kg`
+                      : 'N/A'}
+                  </strong>
+                </span>
+                {visitWeight && originalWeight != null && !isNaN(parseFloat(visitWeight)) && (
+                  <span>
+                    Change from last visit:{' '}
+                    <strong className={cn(
+                      parseFloat(visitWeight) < originalWeight ? 'text-emerald-600' : 'text-amber-600'
+                    )}>
+                      {parseFloat(visitWeight) === originalWeight
+                        ? 'No change'
+                        : `${parseFloat(visitWeight) > originalWeight ? '+' : ''}${(parseFloat(visitWeight) - originalWeight).toFixed(1)} kg`}
+                    </strong>
+                  </span>
+                )}
+              </div>
+            )}
+
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={isSavingMeasurements}
+              onClick={handleSaveMeasurements}
+              className="gap-1.5"
+            >
+              {isSavingMeasurements ? (
+                <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Saving…</>
+              ) : (
+                <><CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" /> Save Measurements</>
+              )}
+            </Button>
           </CardContent>
         </Card>
       )}
@@ -861,6 +1081,8 @@ export function DocumentComposer({
                       { label: 'BMI', value: liveSnapshotData.bmi },
                       { label: 'Ideal Body Weight', value: liveSnapshotData.ibw },
                       { label: 'Weight Difference', value: liveSnapshotData.weightDiff },
+                      { label: 'Previous Visit Weight', value: liveSnapshotData.previousWeight },
+                      { label: 'Weight Change (This Visit)', value: liveSnapshotData.weightChange },
                       { label: 'Primary Goal', value: liveSnapshotData.primaryGoal },
                       { label: 'Activity Level', value: liveSnapshotData.activityLevel },
                       { label: 'Medical Conditions', value: liveSnapshotData.medicalConditions },
