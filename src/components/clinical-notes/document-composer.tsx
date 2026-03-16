@@ -23,6 +23,7 @@ import {
   RotateCcw,
   Download,
   MessageCircle,
+  BookmarkPlus,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -79,45 +80,65 @@ const DOC_TYPE_LABELS: Record<string, string> = {
   custom: 'Custom Document',
 }
 
-// ── Document type title prefill ───────────────────────────────────────────────────
-// Predefined types get their label as the default title.
-// 'custom' is intentionally omitted — the dietitian must enter their own title.
-const DOC_TYPE_TITLE_PREFILL: Partial<Record<DocumentType, string>> = {
-  meal_plan: 'Meal Plan',
-  quick_note: 'Quick Note',
-  follow_up_recommendation: 'Follow-up Recommendation',
+// ── Templates (localStorage, no DB) ─────────────────────────────────────────
+
+interface DocTemplate {
+  id: string
+  name: string
+  docType: DocumentType
+  blocks: DocumentBlock[]
+  createdAt: string
+}
+
+const TEMPLATES_KEY = 'peepal_doc_templates'
+
+function loadTemplatesFromStorage(): DocTemplate[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(TEMPLATES_KEY)
+    return raw ? (JSON.parse(raw) as DocTemplate[]) : []
+  } catch {
+    return []
+  }
+}
+
+function saveTemplatesToStorage(templates: DocTemplate[]): void {
+  if (typeof window === 'undefined') return
+  localStorage.setItem(TEMPLATES_KEY, JSON.stringify(templates))
 }
 
 // ── Default blocks per document type ───────────────────────────────────────
-// Title blocks (type:'title') are intentionally excluded.
-// The dietitian title lives in the top-level docTitle field only.
 
 function defaultBlocksForType(type: DocumentType): DocumentBlock[] {
   const id = () => crypto.randomUUID()
   switch (type) {
     case 'meal_plan':
       return [
-        { id: id(), type: 'meal_section', label: 'Breakfast', content: '', order: 0 },
-        { id: id(), type: 'meal_section', label: 'Mid-Morning Snack', content: '', order: 1 },
-        { id: id(), type: 'meal_section', label: 'Lunch', content: '', order: 2 },
-        { id: id(), type: 'meal_section', label: 'Evening Snack', content: '', order: 3 },
-        { id: id(), type: 'meal_section', label: 'Dinner', content: '', order: 4 },
-        { id: id(), type: 'instructions', label: 'Instructions', content: '', order: 5 },
+        { id: id(), type: 'title', label: 'Plan Title', content: '', order: 0 },
+        { id: id(), type: 'meal_section', label: 'Breakfast', content: '', order: 1 },
+        { id: id(), type: 'meal_section', label: 'Mid-Morning Snack', content: '', order: 2 },
+        { id: id(), type: 'meal_section', label: 'Lunch', content: '', order: 3 },
+        { id: id(), type: 'meal_section', label: 'Evening Snack', content: '', order: 4 },
+        { id: id(), type: 'meal_section', label: 'Dinner', content: '', order: 5 },
+        { id: id(), type: 'instructions', label: 'Instructions', content: '', order: 6 },
       ]
     case 'follow_up_recommendation':
       return [
-        { id: id(), type: 'custom', label: 'Progress Summary', content: '', order: 0 },
-        { id: id(), type: 'custom', label: 'Recommendations', content: '', order: 1 },
-        { id: id(), type: 'custom', label: 'Next Steps', content: '', order: 2 },
+        { id: id(), type: 'title', label: 'Document Title', content: '', order: 0 },
+        { id: id(), type: 'custom', label: 'Progress Summary', content: '', order: 1 },
+        { id: id(), type: 'custom', label: 'Recommendations', content: '', order: 2 },
+        { id: id(), type: 'custom', label: 'Next Steps', content: '', order: 3 },
       ]
     case 'quick_note':
       return [
-        { id: id(), type: 'custom', label: 'Notes', content: '', order: 0 },
+        { id: id(), type: 'title', label: 'Note Title', content: '', order: 0 },
+        { id: id(), type: 'custom', label: 'Notes', content: '', order: 1 },
       ]
     case 'custom':
     default:
       return [
-        { id: id(), type: 'custom', label: 'Content', content: '', order: 0 },
+        { id: id(), type: 'title', label: 'Document Title', content: '', order: 0 },
+        { id: id(), type: 'custom', label: 'Content', content: '', order: 1 },
       ]
   }
 }
@@ -244,23 +265,13 @@ export function DocumentComposer({
   const [docType, setDocType] = useState<DocumentType>(
     (existingNote?.document_type as DocumentType) ?? 'meal_plan'
   )
-  const [docTitle, setDocTitle] = useState<string>(() => {
-    // Edit mode: always use the stored title
-    if (existingNote?.title) return existingNote.title
-    // Create mode: prefill from the default title map;
-    // custom documents start with an empty title so the dietitian enters it manually
-    const initialType: DocumentType = (existingNote?.document_type as DocumentType) ?? 'meal_plan'
-    return DOC_TYPE_TITLE_PREFILL[initialType] ?? ''
-  })
+  const [docTitle, setDocTitle] = useState(existingNote?.title ?? '')
   const [blocks, setBlocks] = useState<DocumentBlock[]>(() => {
     if (existingNote?.content) {
       const parsed = existingNote.content as unknown
       if (Array.isArray(parsed)) {
-        // Strip patient_snapshot blocks (regenerated on every save) and legacy
-        // title blocks (title now lives exclusively in the docTitle field above)
-        return (parsed as DocumentBlock[]).filter(
-          (b) => b.type !== 'patient_snapshot' && b.type !== 'title'
-        )
+        // Strip patient_snapshot blocks — they are regenerated fresh on every save
+        return (parsed as DocumentBlock[]).filter((b) => b.type !== 'patient_snapshot')
       }
     }
     return defaultBlocksForType(
@@ -289,8 +300,13 @@ export function DocumentComposer({
   const [pdfPending, setPdfPending] = useState(false)
   const [waPending, setWaPending] = useState(false)
   const [dietitianPDFData, setDietitianPDFData] = useState<DietitianPDFData | null>(null)
+  // Templates: stored in localStorage, never in the DB
+  const [localTemplates, setLocalTemplates] = useState<DocTemplate[]>([])
 
-  // ── Fetch patient if pre-selected by URL or from existing note ──────
+  // Load templates from localStorage (client-side only)
+  useEffect(() => {
+    setLocalTemplates(loadTemplatesFromStorage())
+  }, [])
   useEffect(() => {
     if (patient) return
     const pid = preselectedPatientId ?? existingNote?.patient_id
@@ -368,6 +384,36 @@ export function DocumentComposer({
       return copy.map((b, i) => ({ ...b, order: i }))
     })
   }, [])
+
+  // ── Template management ─────────────────────────────────────────────
+  const handleSaveTemplate = () => {
+    const name = window.prompt('Template name:', docTitle || 'Untitled Template')
+    if (!name?.trim()) return
+    // Save content blocks only (exclude title/snapshot blocks from the template)
+    const contentBlocks = blocks.filter((b) => b.type !== 'title' && b.type !== 'patient_snapshot')
+    const newTpl: DocTemplate = {
+      id: crypto.randomUUID(),
+      name: name.trim(),
+      docType,
+      blocks: contentBlocks,
+      createdAt: new Date().toISOString(),
+    }
+    const existing = loadTemplatesFromStorage()
+    // Replace any template with the same name (case-insensitive)
+    const filtered = existing.filter((t) => t.name.toLowerCase() !== name.trim().toLowerCase())
+    const updated = [...filtered, newTpl]
+    saveTemplatesToStorage(updated)
+    setLocalTemplates(updated)
+    alert(`Template "${name.trim()}" saved.`)
+  }
+
+  const handleLoadTemplate = (tplId: string) => {
+    const tpl = localTemplates.find((t) => t.id === tplId)
+    if (!tpl) return
+    setDocType(tpl.docType)
+    setBlocks(tpl.blocks.map((b, i) => ({ ...b, id: crypto.randomUUID(), order: i })))
+    setAiEnhancedBlocks(null)
+  }
 
   // ── Document type change ────────────────────────────────────────────
   const handleDocTypeChange = (type: DocumentType) => {
@@ -777,6 +823,30 @@ export function DocumentComposer({
               />
             </div>
           </div>
+
+          {localTemplates.length > 0 && (
+            <div className="space-y-1.5">
+              <Label>Load from Template</Label>
+              <Select onValueChange={(id: string | null) => id && handleLoadTemplate(id)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select a saved template…" />
+                </SelectTrigger>
+                <SelectContent>
+                  {localTemplates
+                    .slice()
+                    .sort((a, b) => a.name.localeCompare(b.name))
+                    .map((t) => (
+                      <SelectItem key={t.id} value={t.id}>
+                        {t.name}
+                        <span className="ml-2 text-xs text-muted-foreground">
+                          ({DOC_TYPE_LABELS[t.docType] ?? t.docType})
+                        </span>
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -974,7 +1044,11 @@ export function DocumentComposer({
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
-          {blocks.map((block, idx) => (
+          {blocks.map((block, idx) => {
+            // For Custom Document type, hide the internal title block entirely —
+            // the title is already captured in the top-level Title field.
+            if (docType === 'custom' && block.type === 'title') return null
+            return (
             <div
               key={block.id}
               className="group rounded-lg border bg-background p-4 space-y-2"
@@ -1032,7 +1106,8 @@ export function DocumentComposer({
                 className="resize-none"
               />
             </div>
-          ))}
+          )
+        })}
         </CardContent>
       </Card>
 
@@ -1184,9 +1259,9 @@ export function DocumentComposer({
                 </div>
               )}
 
-              {/* Document title — always uppercase in the rendered document */}
-              <h2 className="text-xl font-bold leading-tight uppercase tracking-wide">
-                {docTitle || <span className="text-muted-foreground italic font-normal text-base normal-case tracking-normal">Untitled Document</span>}
+              {/* Document title */}
+              <h2 className="text-xl font-bold leading-tight">
+                {docTitle || <span className="text-muted-foreground italic font-normal text-base">Untitled Document</span>}
               </h2>
 
               {/* Patient snapshot header */}
@@ -1250,6 +1325,16 @@ export function DocumentComposer({
             <Save className="h-4 w-4" />
           )}
           {isEditMode ? 'Update Document' : 'Save Document'}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={isPending || pdfPending || waPending}
+          onClick={handleSaveTemplate}
+          className="gap-2"
+        >
+          <BookmarkPlus className="h-4 w-4" />
+          Save as Template
         </Button>
         <Button
           type="button"
