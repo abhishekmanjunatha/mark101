@@ -10,6 +10,8 @@ type EnhanceAction = 'enhance' | 'patient_friendly' | 'suggest'
 interface EnhanceRequestBody {
   action: EnhanceAction
   content: string
+  docType?: string
+  docTitle?: string
   patientContext?: Record<string, unknown>
 }
 
@@ -37,7 +39,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
   }
 
-  const { action, content, patientContext } = body
+  const { action, content, docType, docTitle, patientContext } = body
 
   if (!action || !content) {
     return NextResponse.json(
@@ -50,20 +52,50 @@ export async function POST(request: NextRequest) {
     ? `\n\nPatient Context:\n- Age: ${patientContext.age ?? 'N/A'}\n- Gender: ${patientContext.gender ?? 'N/A'}\n- Height: ${patientContext.height_cm ?? 'N/A'} cm\n- Weight: ${patientContext.weight_kg ?? 'N/A'} kg\n- Primary Goal: ${patientContext.primary_goal ?? 'N/A'}\n- Activity Level: ${patientContext.activity_level ?? 'N/A'}\n- Dietary Type: ${patientContext.dietary_type ?? 'N/A'}\n- Medical Conditions: ${patientContext.medical_conditions ?? 'None'}\n- Food Allergies: ${patientContext.food_allergies ?? 'None'}`
     : ''
 
+  const docTypeLabel =
+    docType === 'meal_plan' ? 'Meal Plan'
+    : docType === 'quick_note' ? 'Quick Note'
+    : docType === 'follow_up_recommendation' ? 'Follow-up Recommendation'
+    : 'Clinical Document'
+
+  const titleLine = docTitle ? `\nDocument Title: ${docTitle}` : ''
+  const isNutritionDoc = docType === 'meal_plan'
+
   const systemPrompts: Record<EnhanceAction, string> = {
-    enhance: `You are a clinical nutrition assistant improving a structured clinical document. The document has sections marked with ## headings (e.g. ## Breakfast, ## Lunch). You MUST follow these rules exactly:
-1. Return the document using the EXACT SAME ## headings in the same order (e.g. ## Breakfast, ## Mid-Morning Snack, ## Lunch, ## Dinner, ## Instructions)
+    enhance: isNutritionDoc
+      ? `You are a clinical nutrition assistant improving a structured meal plan document. The document has sections marked with ## headings (e.g. ## Breakfast, ## Lunch). You MUST follow these rules exactly:
+1. Return the document using the EXACT SAME ## headings in the same order
 2. Improve the content within each section for clarity, specificity, and professionalism
 3. Do NOT add new sections, introductions, summaries, or preambles
 4. Do NOT include patient background information inside the output — use it only to tailor the content
-5. Start your response directly with the first ## heading — no introductory text${contextBlock}`,
-    patient_friendly: `You are a nutrition communication specialist rewriting a structured clinical document for patients. The document has sections marked with ## headings. You MUST follow these rules exactly:
+5. Start your response directly with the first ## heading — no introductory text${contextBlock}`
+      : `You are a clinical documentation assistant enhancing a structured document.
+Document Type: ${docTypeLabel}${titleLine}
+
+STRICT RULES:
+1. Only enhance, reformat, or clarify the exact content the user has provided. Do NOT invent or add unrelated content.
+2. Do NOT generate nutrition plans, meal plans, or dietary recommendations unless the document explicitly contains them.
+3. Preserve the intent and subject matter of the original content completely.
+4. Return the document using the EXACT SAME ## headings in the same order.
+5. Improve grammar, clarity, structure, and professional formatting only.
+6. Start your response directly with the first ## heading — no introductory text.${contextBlock}`,
+    patient_friendly: isNutritionDoc
+      ? `You are a nutrition communication specialist rewriting a structured meal plan for patients. The document has sections marked with ## headings. You MUST follow these rules exactly:
 1. Return the document using the EXACT SAME ## headings in the same order
 2. Rewrite content within each section in simple, warm, conversational language — no medical jargon
 3. Do NOT add introductions, conclusions, or patient background information in the output
 4. Do NOT add new sections — only rewrite existing ones
-5. Start your response directly with the first ## heading — no introductory text${contextBlock}`,
-    suggest: `You are a dietitian's AI assistant. Based on the patient context and the document content below, provide 3-5 brief, actionable health suggestions or alerts. Format each as a bullet point starting with an emoji. Be specific to the patient's conditions and goals. Return only the suggestions.${contextBlock}`,
+5. Start your response directly with the first ## heading — no introductory text${contextBlock}`
+      : `You are a clinical communication specialist rewriting a ${docTypeLabel.toLowerCase()} for patients.
+Document Type: ${docTypeLabel}${titleLine}
+
+STRICT RULES:
+1. Rewrite only the content provided in simple, clear, friendly language a patient can easily understand.
+2. Do NOT generate unrelated content, nutrition plans, or medical advice not already present in the original.
+3. Preserve the subject matter of the original document completely.
+4. Return the document using the EXACT SAME ## headings in the same order.
+5. Start your response directly with the first ## heading — no introductory text.${contextBlock}`,
+    suggest: `You are a dietitian's AI assistant. Based on the patient context and the document content below, provide 3-5 brief, actionable health suggestions relevant to the document's context and the patient's specific conditions and goals. Format each as a bullet point starting with an emoji. Return only the suggestions.${contextBlock}`,
   }
 
   const systemPrompt = systemPrompts[action]

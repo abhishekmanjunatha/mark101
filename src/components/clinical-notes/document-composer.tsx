@@ -302,6 +302,7 @@ export function DocumentComposer({
   const [dietitianPDFData, setDietitianPDFData] = useState<DietitianPDFData | null>(null)
   // Templates: stored in localStorage, never in the DB
   const [localTemplates, setLocalTemplates] = useState<DocTemplate[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null)
 
   // Load templates from localStorage (client-side only)
   useEffect(() => {
@@ -413,10 +414,12 @@ export function DocumentComposer({
     setDocType(tpl.docType)
     setBlocks(tpl.blocks.map((b, i) => ({ ...b, id: crypto.randomUUID(), order: i })))
     setAiEnhancedBlocks(null)
+    setSelectedTemplateId(tplId)
   }
 
   // ── Document type change ────────────────────────────────────────────
   const handleDocTypeChange = (type: DocumentType) => {
+    setSelectedTemplateId(null)
     setDocType(type)
     // Only reset blocks if all content is empty (fresh start)
     const hasContent = blocks.some((b) => b.content.trim())
@@ -430,6 +433,7 @@ export function DocumentComposer({
   // ── AI Actions ──────────────────────────────────────────────────────
   const callAI = async (action: 'enhance' | 'patient_friendly' | 'suggest') => {
     const contentText = blocks
+      .filter((b) => b.type !== 'title' && b.type !== 'patient_snapshot')
       .map((b) => `## ${b.label}\n${b.content}`)
       .join('\n\n')
 
@@ -448,6 +452,8 @@ export function DocumentComposer({
         body: JSON.stringify({
           action,
           content: contentText,
+          docType,
+          docTitle: docTitle.trim() || undefined,
           patientContext: patient
             ? {
                 age: computeAge(patient.date_of_birth),
@@ -796,17 +802,45 @@ export function DocumentComposer({
             <div className="space-y-1.5">
               <Label>Type</Label>
               <Select
-                value={docType}
-                onValueChange={(v) => handleDocTypeChange(v as DocumentType)}
+                value={selectedTemplateId ?? docType}
+                onValueChange={(v) => {
+                  if (!v) return
+                  const isTemplate = localTemplates.some((t) => t.id === v)
+                  if (isTemplate) {
+                    handleLoadTemplate(v)
+                  } else {
+                    setSelectedTemplateId(null)
+                    handleDocTypeChange(v as DocumentType)
+                  }
+                }}
               >
                 <SelectTrigger className="w-full">
-                  <span className="text-sm">{DOC_TYPE_LABELS[docType] ?? docType}</span>
+                  <span className="text-sm">
+                    {selectedTemplateId
+                      ? (localTemplates.find((t) => t.id === selectedTemplateId)?.name ?? DOC_TYPE_LABELS[docType] ?? docType)
+                      : (DOC_TYPE_LABELS[docType] ?? docType)}
+                  </span>
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="quick_note">Quick Note</SelectItem>
                   <SelectItem value="meal_plan">Meal Plan</SelectItem>
                   <SelectItem value="follow_up_recommendation">Follow-up Recommendation</SelectItem>
                   <SelectItem value="custom">Custom Document</SelectItem>
+                  {localTemplates.length > 0 && (
+                    <>
+                      <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground border-t mt-1 pt-2">
+                        Saved Templates
+                      </div>
+                      {localTemplates
+                        .slice()
+                        .sort((a, b) => a.name.localeCompare(b.name))
+                        .map((t) => (
+                          <SelectItem key={t.id} value={t.id}>
+                            {t.name}
+                          </SelectItem>
+                        ))}
+                    </>
+                  )}
                 </SelectContent>
               </Select>
             </div>
@@ -824,29 +858,6 @@ export function DocumentComposer({
             </div>
           </div>
 
-          {localTemplates.length > 0 && (
-            <div className="space-y-1.5">
-              <Label>Load from Template</Label>
-              <Select onValueChange={(id: string | null) => id && handleLoadTemplate(id)}>
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="Select a saved template…" />
-                </SelectTrigger>
-                <SelectContent>
-                  {localTemplates
-                    .slice()
-                    .sort((a, b) => a.name.localeCompare(b.name))
-                    .map((t) => (
-                      <SelectItem key={t.id} value={t.id}>
-                        {t.name}
-                        <span className="ml-2 text-xs text-muted-foreground">
-                          ({DOC_TYPE_LABELS[t.docType] ?? t.docType})
-                        </span>
-                      </SelectItem>
-                    ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
         </CardContent>
       </Card>
 
