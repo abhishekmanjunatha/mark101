@@ -417,6 +417,16 @@ export function DocumentComposer({
     setSelectedTemplateId(tplId)
   }
 
+  const handleDeleteTemplate = (tplId: string) => {
+    const tpl = localTemplates.find((t) => t.id === tplId)
+    if (!tpl) return
+    if (!window.confirm(`Delete template "${tpl.name}"? This cannot be undone.`)) return
+    const updated = localTemplates.filter((t) => t.id !== tplId)
+    saveTemplatesToStorage(updated)
+    setLocalTemplates(updated)
+    if (selectedTemplateId === tplId) setSelectedTemplateId(null)
+  }
+
   // ── Document type change ────────────────────────────────────────────
   const handleDocTypeChange = (type: DocumentType) => {
     setSelectedTemplateId(null)
@@ -858,6 +868,42 @@ export function DocumentComposer({
             </div>
           </div>
 
+          {/* Saved Templates management — only shown when templates exist */}
+          {localTemplates.length > 0 && (
+            <div className="space-y-1.5 pt-1">
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Saved Templates</p>
+              <div className="flex flex-col gap-1">
+                {localTemplates
+                  .slice()
+                  .sort((a, b) => a.name.localeCompare(b.name))
+                  .map((t) => (
+                    <div
+                      key={t.id}
+                      className="flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm bg-muted/40"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => handleLoadTemplate(t.id)}
+                        className="flex-1 text-left truncate hover:text-foreground text-muted-foreground transition-colors"
+                      >
+                        {t.name}
+                        <span className="ml-2 text-xs opacity-60">
+                          ({DOC_TYPE_LABELS[t.docType] ?? t.docType})
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteTemplate(t.id)}
+                        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
+                        title="Delete template"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
