@@ -188,6 +188,27 @@ function computeWeightDiff(
   return (diff >= 0 ? '+' : '') + diff.toFixed(1) + ' kg'
 }
 
+// ── Markdown sanitiser ───────────────────────────────────────────────────────
+// Strips AI-generated markdown formatting before preview / PDF rendering.
+// Kept at module level so it can be used both inside callAI (at source) and
+// inside previewContent (as a fallback for existing saved content).
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+/gm, '')              // ## headings
+    .replace(/\*\*\*([^*]+)\*\*\*/g, '$1')    // ***bold-italic***
+    .replace(/\*\*([^*]+)\*\*/g, '$1')        // **bold**
+    .replace(/\*([^*]+)\*/g, '$1')             // *italic*
+    .replace(/_{2}([^_]+)_{2}/g, '$1')         // __bold__
+    .replace(/_([^_]+)_/g, '$1')               // _italic_
+    .replace(/`{3}[\s\S]*?`{3}/g, '')          // ```code blocks```
+    .replace(/`([^`]+)`/g, '$1')               // `inline code`
+    .replace(/^[-*+]\s+/gm, '\u2022 ')        // - list  →  • bullet
+    .replace(/^\d+\.\s+/gm, '')               // 1. ordered list
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')  // [text](url) → text
+    .replace(/\\([\\`*_{}[\]()#+\-.!])/g, '$1') // escaped chars
+    .trim()
+}
+
 interface PatientSnapshotData {
   name: string
   age: string
@@ -494,7 +515,7 @@ export function DocumentComposer({
 
         // Safety: AI returned unstructured text — show raw output only, never touch blocks
         if (rawSections.length === 0) {
-          setAiRawResult(aiResult)
+          setAiRawResult(stripMarkdown(aiResult))
           setAiEnhancedBlocks(null)
           setShowPreview(true)
           toast.success('AI output ready — review in preview below')
@@ -509,7 +530,7 @@ export function DocumentComposer({
             sectionMap[raw.trim().toLowerCase()] = ''
           } else {
             const heading = raw.slice(0, newlineIdx).trim().toLowerCase()
-            const content = raw.slice(newlineIdx + 1).trim()
+            const content = stripMarkdown(raw.slice(newlineIdx + 1).trim())
             sectionMap[heading] = content
           }
         }
@@ -534,7 +555,7 @@ export function DocumentComposer({
                   const raw = rawSections[sectionIdx]
                   const newlineIdx = raw.indexOf('\n')
                   const content = newlineIdx !== -1 ? raw.slice(newlineIdx + 1).trim() : raw.trim()
-                  updated[i] = { ...updated[i], content }
+                  updated[i] = { ...updated[i], content: stripMarkdown(content) }
                   sectionIdx++
                 }
               }
@@ -784,8 +805,11 @@ export function DocumentComposer({
   const previewContent = previewBlocks
     .filter((b) => b.type !== 'title' && b.type !== 'patient_snapshot')
     .map(
-      (b) =>
-        `<h3 class="font-semibold text-sm mt-4 mb-1">${b.label}</h3><p class="text-sm whitespace-pre-wrap">${b.content || '<span class="text-muted-foreground italic">Empty</span>'}</p>`
+      (b) => {
+        const safe = b.content ? stripMarkdown(b.content) : ''
+        const display = safe || '<span class="text-muted-foreground italic">Empty</span>'
+        return `<h3 class="font-semibold text-sm mt-4 mb-1">${b.label}</h3><p class="text-sm whitespace-pre-wrap">${display}</p>`
+      }
     )
     .join('')
 
