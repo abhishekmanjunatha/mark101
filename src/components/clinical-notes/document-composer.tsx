@@ -79,38 +79,45 @@ const DOC_TYPE_LABELS: Record<string, string> = {
   custom: 'Custom Document',
 }
 
+// ── Document type title prefill ───────────────────────────────────────────────────
+// Predefined types get their label as the default title.
+// 'custom' is intentionally omitted — the dietitian must enter their own title.
+const DOC_TYPE_TITLE_PREFILL: Partial<Record<DocumentType, string>> = {
+  meal_plan: 'Meal Plan',
+  quick_note: 'Quick Note',
+  follow_up_recommendation: 'Follow-up Recommendation',
+}
+
 // ── Default blocks per document type ───────────────────────────────────────
+// Title blocks (type:'title') are intentionally excluded.
+// The dietitian title lives in the top-level docTitle field only.
 
 function defaultBlocksForType(type: DocumentType): DocumentBlock[] {
   const id = () => crypto.randomUUID()
   switch (type) {
     case 'meal_plan':
       return [
-        { id: id(), type: 'title', label: 'Plan Title', content: '', order: 0 },
-        { id: id(), type: 'meal_section', label: 'Breakfast', content: '', order: 1 },
-        { id: id(), type: 'meal_section', label: 'Mid-Morning Snack', content: '', order: 2 },
-        { id: id(), type: 'meal_section', label: 'Lunch', content: '', order: 3 },
-        { id: id(), type: 'meal_section', label: 'Evening Snack', content: '', order: 4 },
-        { id: id(), type: 'meal_section', label: 'Dinner', content: '', order: 5 },
-        { id: id(), type: 'instructions', label: 'Instructions', content: '', order: 6 },
+        { id: id(), type: 'meal_section', label: 'Breakfast', content: '', order: 0 },
+        { id: id(), type: 'meal_section', label: 'Mid-Morning Snack', content: '', order: 1 },
+        { id: id(), type: 'meal_section', label: 'Lunch', content: '', order: 2 },
+        { id: id(), type: 'meal_section', label: 'Evening Snack', content: '', order: 3 },
+        { id: id(), type: 'meal_section', label: 'Dinner', content: '', order: 4 },
+        { id: id(), type: 'instructions', label: 'Instructions', content: '', order: 5 },
       ]
     case 'follow_up_recommendation':
       return [
-        { id: id(), type: 'title', label: 'Document Title', content: '', order: 0 },
-        { id: id(), type: 'custom', label: 'Progress Summary', content: '', order: 1 },
-        { id: id(), type: 'custom', label: 'Recommendations', content: '', order: 2 },
-        { id: id(), type: 'custom', label: 'Next Steps', content: '', order: 3 },
+        { id: id(), type: 'custom', label: 'Progress Summary', content: '', order: 0 },
+        { id: id(), type: 'custom', label: 'Recommendations', content: '', order: 1 },
+        { id: id(), type: 'custom', label: 'Next Steps', content: '', order: 2 },
       ]
     case 'quick_note':
       return [
-        { id: id(), type: 'title', label: 'Note Title', content: '', order: 0 },
-        { id: id(), type: 'custom', label: 'Notes', content: '', order: 1 },
+        { id: id(), type: 'custom', label: 'Notes', content: '', order: 0 },
       ]
     case 'custom':
     default:
       return [
-        { id: id(), type: 'title', label: 'Document Title', content: '', order: 0 },
-        { id: id(), type: 'custom', label: 'Content', content: '', order: 1 },
+        { id: id(), type: 'custom', label: 'Content', content: '', order: 0 },
       ]
   }
 }
@@ -237,13 +244,23 @@ export function DocumentComposer({
   const [docType, setDocType] = useState<DocumentType>(
     (existingNote?.document_type as DocumentType) ?? 'meal_plan'
   )
-  const [docTitle, setDocTitle] = useState(existingNote?.title ?? '')
+  const [docTitle, setDocTitle] = useState<string>(() => {
+    // Edit mode: always use the stored title
+    if (existingNote?.title) return existingNote.title
+    // Create mode: prefill from the default title map;
+    // custom documents start with an empty title so the dietitian enters it manually
+    const initialType: DocumentType = (existingNote?.document_type as DocumentType) ?? 'meal_plan'
+    return DOC_TYPE_TITLE_PREFILL[initialType] ?? ''
+  })
   const [blocks, setBlocks] = useState<DocumentBlock[]>(() => {
     if (existingNote?.content) {
       const parsed = existingNote.content as unknown
       if (Array.isArray(parsed)) {
-        // Strip patient_snapshot blocks — they are regenerated fresh on every save
-        return (parsed as DocumentBlock[]).filter((b) => b.type !== 'patient_snapshot')
+        // Strip patient_snapshot blocks (regenerated on every save) and legacy
+        // title blocks (title now lives exclusively in the docTitle field above)
+        return (parsed as DocumentBlock[]).filter(
+          (b) => b.type !== 'patient_snapshot' && b.type !== 'title'
+        )
       }
     }
     return defaultBlocksForType(
@@ -1167,9 +1184,9 @@ export function DocumentComposer({
                 </div>
               )}
 
-              {/* Document title */}
-              <h2 className="text-xl font-bold leading-tight">
-                {docTitle || <span className="text-muted-foreground italic font-normal text-base">Untitled Document</span>}
+              {/* Document title — always uppercase in the rendered document */}
+              <h2 className="text-xl font-bold leading-tight uppercase tracking-wide">
+                {docTitle || <span className="text-muted-foreground italic font-normal text-base normal-case tracking-normal">Untitled Document</span>}
               </h2>
 
               {/* Patient snapshot header */}
